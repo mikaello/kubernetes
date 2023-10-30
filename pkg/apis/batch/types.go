@@ -600,7 +600,7 @@ type CronJobSpec struct {
 	// database by the API server during CronJob validation and the controller manager during execution.
 	// If no system-wide time zone database can be found a bundled version of the database is used instead.
 	// If the time zone name becomes invalid during the lifetime of a CronJob or due to a change in host
-	// configuration, the controller will stop creating new new Jobs and will create a system event with the
+	// configuration, the controller will stop creating new Jobs and will create a system event with the
 	// reason UnknownTimeZone.
 	// More information can be found in https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/#time-zones
 	// +optional
