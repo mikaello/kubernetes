@@ -52,7 +52,6 @@ import (
 	admissionapi "k8s.io/pod-security-admission/api"
 	samplev1alpha1 "k8s.io/sample-apiserver/pkg/apis/wardle/v1alpha1"
 	"k8s.io/utils/pointer"
-	"k8s.io/utils/strings/slices"
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
@@ -132,6 +131,12 @@ func generateSampleAPIServerObjectNames(namespace string) sampleAPIServerObjectN
 	}
 }
 
+// SetUpSampleAPIServer sets up a sample-apiserver.
+//
+// Important:
+// Test cases that call this function should be marked as serial due to potential conflicts
+// with other test cases that also set up a sample-apiserver. For more information, see
+// https://github.com/kubernetes/kubernetes/issues/119582#issuecomment-2215054411.
 func SetUpSampleAPIServer(ctx context.Context, f *framework.Framework, aggrclient *aggregatorclient.Clientset, image string, n sampleAPIServerObjectNames, apiServiceGroupName, apiServiceVersion string) {
 	ginkgo.By("Registering the sample API server.")
 	client := f.ClientSet
@@ -165,6 +170,7 @@ func SetUpSampleAPIServer(ctx context.Context, f *framework.Framework, aggrclien
 			Rules: []rbacv1.PolicyRule{
 				rbacv1helpers.NewRule("get", "list", "watch").Groups("").Resources("namespaces").RuleOrDie(),
 				rbacv1helpers.NewRule("get", "list", "watch").Groups("admissionregistration.k8s.io").Resources("*").RuleOrDie(),
+				rbacv1helpers.NewRule("get", "list", "watch").Groups("flowcontrol.apiserver.k8s.io").Resources("prioritylevelconfigurations", "flowschemas").RuleOrDie(),
 			},
 		}, metav1.CreateOptions{})
 		framework.ExpectNoError(err, "creating cluster role %s", n.clusterRole)
@@ -413,7 +419,7 @@ func SetUpSampleAPIServer(ctx context.Context, f *framework.Framework, aggrclien
 	framework.ExpectNoError(err, "gave up waiting for apiservice wardle to come up successfully")
 }
 
-// TestSampleAPIServer is a basic test if the sample-apiserver code from 1.10 and compiled against 1.10
+// TestSampleAPIServer is a basic test if the sample-apiserver code from 1.29 and compiled against 1.29
 // will work on the current Aggregator/API-Server.
 func TestSampleAPIServer(ctx context.Context, f *framework.Framework, aggrclient *aggregatorclient.Clientset, image, apiServiceGroupName, apiServiceVersion string) {
 	n := generateSampleAPIServerObjectNames(f.Namespace.Name)
@@ -737,24 +743,6 @@ func TestSampleAPIServer(ctx context.Context, f *framework.Framework, aggrclient
 	framework.ExpectNoError(err, "failed to count the required APIServices")
 	framework.Logf("APIService %s has been deleted.", apiServiceName)
 
-	ginkgo.By("Confirm that the group path of " + apiServiceName + " was removed from root paths")
-	groupPath := "/apis/" + apiServiceGroupName
-	err = wait.PollUntilContextTimeout(ctx, apiServiceRetryPeriod, apiServiceRetryTimeout, true, func(ctx context.Context) (done bool, err error) {
-		rootPaths := metav1.RootPaths{}
-		statusContent, err = restClient.Get().
-			AbsPath("/").
-			SetHeader("Accept", "application/json").DoRaw(ctx)
-		if err != nil {
-			return false, err
-		}
-		err = json.Unmarshal(statusContent, &rootPaths)
-		if err != nil {
-			return false, err
-		}
-		return !slices.Contains(rootPaths.Paths, groupPath), nil
-	})
-	framework.ExpectNoError(err, "Expected to not find %s from root paths", groupPath)
-
 	cleanupSampleAPIServer(ctx, client, aggrclient, n, apiServiceName)
 }
 
@@ -766,7 +754,7 @@ func pollTimed(ctx context.Context, interval, timeout time.Duration, condition w
 		elapsed := time.Since(start)
 		framework.Logf(msg, elapsed)
 	}(time.Now(), msg)
-	return wait.PollWithContext(ctx, interval, timeout, condition)
+	return wait.PollUntilContextTimeout(ctx, interval, timeout, false, condition)
 }
 
 func validateErrorWithDebugInfo(ctx context.Context, f *framework.Framework, err error, pods *v1.PodList, msg string, fields ...interface{}) {

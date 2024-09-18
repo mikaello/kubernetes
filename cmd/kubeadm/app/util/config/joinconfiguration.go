@@ -26,7 +26,7 @@ import (
 
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmscheme "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/scheme"
-	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
 	"k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/validation"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util"
@@ -62,13 +62,20 @@ func SetJoinControlPlaneDefaults(cfg *kubeadmapi.JoinControlPlane) error {
 // Right thereafter, the configuration is defaulted again with dynamic values (like IP addresses of a machine, etc)
 // Lastly, the internal config is validated and returned.
 func LoadOrDefaultJoinConfiguration(cfgPath string, defaultversionedcfg *kubeadmapiv1.JoinConfiguration, opts LoadOrDefaultConfigurationOptions) (*kubeadmapi.JoinConfiguration, error) {
+	var (
+		config *kubeadmapi.JoinConfiguration
+		err    error
+	)
 	if cfgPath != "" {
 		// Loads configuration from config file, if provided
-		// Nb. --config overrides command line flags, TODO: fix this
-		return LoadJoinConfigurationFromFile(cfgPath, opts)
+		config, err = LoadJoinConfigurationFromFile(cfgPath, opts)
+	} else {
+		config, err = DefaultedJoinConfiguration(defaultversionedcfg, opts)
 	}
-
-	return DefaultedJoinConfiguration(defaultversionedcfg, opts)
+	if err == nil {
+		prepareStaticVariables(config)
+	}
+	return config, err
 }
 
 // LoadJoinConfigurationFromFile loads versioned JoinConfiguration from file, converts it to internal, defaults and validates it
@@ -99,7 +106,7 @@ func documentMapToJoinConfiguration(gvkmap kubeadmapi.DocumentMap, allowDeprecat
 		}
 
 		// check if this version is supported and possibly not deprecated
-		if err := validateSupportedVersion(gvk.GroupVersion(), allowDeprecated, allowExperimental); err != nil {
+		if err := validateSupportedVersion(gvk, allowDeprecated, allowExperimental); err != nil {
 			return nil, err
 		}
 

@@ -30,6 +30,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager"
 	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager/bitmask"
 	"k8s.io/kubernetes/pkg/kubelet/metrics"
+	"k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/utils/cpuset"
 )
 
@@ -277,6 +278,12 @@ func (p *staticPolicy) updateCPUsToReuse(pod *v1.Pod, container *v1.Container, c
 	// If so, add its cpuset to the cpuset of reusable CPUs for any new allocations.
 	for _, initContainer := range pod.Spec.InitContainers {
 		if container.Name == initContainer.Name {
+			if types.IsRestartableInitContainer(&initContainer) {
+				// If the container is a restartable init container, we should not
+				// reuse its cpuset, as a restartable init container can run with
+				// regular containers.
+				break
+			}
 			p.cpusToReuse[string(pod.UID)] = p.cpusToReuse[string(pod.UID)].Union(cset)
 			return
 		}
@@ -444,15 +451,21 @@ func (p *staticPolicy) guaranteedCPUs(pod *v1.Pod, container *v1.Container) int 
 func (p *staticPolicy) podGuaranteedCPUs(pod *v1.Pod) int {
 	// The maximum of requested CPUs by init containers.
 	requestedByInitContainers := 0
+	requestedByRestartableInitContainers := 0
 	for _, container := range pod.Spec.InitContainers {
 		if _, ok := container.Resources.Requests[v1.ResourceCPU]; !ok {
 			continue
 		}
 		requestedCPU := p.guaranteedCPUs(pod, &container)
-		if requestedCPU > requestedByInitContainers {
-			requestedByInitContainers = requestedCPU
+		// See https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/753-sidecar-containers#resources-calculation-for-scheduling-and-pod-admission
+		// for the detail.
+		if types.IsRestartableInitContainer(&container) {
+			requestedByRestartableInitContainers += requestedCPU
+		} else if requestedByRestartableInitContainers+requestedCPU > requestedByInitContainers {
+			requestedByInitContainers = requestedByRestartableInitContainers + requestedCPU
 		}
 	}
+
 	// The sum of requested CPUs by app containers.
 	requestedByAppContainers := 0
 	for _, container := range pod.Spec.Containers {
@@ -462,21 +475,27 @@ func (p *staticPolicy) podGuaranteedCPUs(pod *v1.Pod) int {
 		requestedByAppContainers += p.guaranteedCPUs(pod, &container)
 	}
 
-	if requestedByInitContainers > requestedByAppContainers {
+	requestedByLongRunningContainers := requestedByAppContainers + requestedByRestartableInitContainers
+	if requestedByInitContainers > requestedByLongRunningContainers {
 		return requestedByInitContainers
 	}
-	return requestedByAppContainers
+	return requestedByLongRunningContainers
 }
 
 func (p *staticPolicy) takeByTopology(availableCPUs cpuset.CPUSet, numCPUs int) (cpuset.CPUSet, error) {
+	cpuSortingStrategy := CPUSortingStrategyPacked
+	if p.options.DistributeCPUsAcrossCores {
+		cpuSortingStrategy = CPUSortingStrategySpread
+	}
+
 	if p.options.DistributeCPUsAcrossNUMA {
 		cpuGroupSize := 1
 		if p.options.FullPhysicalCPUsOnly {
 			cpuGroupSize = p.topology.CPUsPerCore()
 		}
-		return takeByTopologyNUMADistributed(p.topology, availableCPUs, numCPUs, cpuGroupSize)
+		return takeByTopologyNUMADistributed(p.topology, availableCPUs, numCPUs, cpuGroupSize, cpuSortingStrategy)
 	}
-	return takeByTopologyNUMAPacked(p.topology, availableCPUs, numCPUs)
+	return takeByTopologyNUMAPacked(p.topology, availableCPUs, numCPUs, cpuSortingStrategy)
 }
 
 func (p *staticPolicy) GetTopologyHints(s state.State, pod *v1.Pod, container *v1.Container) map[string][]topologymanager.TopologyHint {
@@ -496,7 +515,7 @@ func (p *staticPolicy) GetTopologyHints(s state.State, pod *v1.Pod, container *v
 	// kubelet restart, for example.
 	if allocated, exists := s.GetCPUSet(string(pod.UID), container.Name); exists {
 		if allocated.Size() != requested {
-			klog.ErrorS(nil, "CPUs already allocated to container with different number than request", "pod", klog.KObj(pod), "containerName", container.Name, "requestedSize", requested, "allocatedSize", allocated.Size())
+			klog.InfoS("CPUs already allocated to container with different number than request", "pod", klog.KObj(pod), "containerName", container.Name, "requestedSize", requested, "allocatedSize", allocated.Size())
 			// An empty list of hints will be treated as a preference that cannot be satisfied.
 			// In definition of hints this is equal to: TopologyHint[NUMANodeAffinity: nil, Preferred: false].
 			// For all but the best-effort policy, the Topology Manager will throw a pod-admission error.
@@ -546,7 +565,7 @@ func (p *staticPolicy) GetPodTopologyHints(s state.State, pod *v1.Pod) map[strin
 		// kubelet restart, for example.
 		if allocated, exists := s.GetCPUSet(string(pod.UID), container.Name); exists {
 			if allocated.Size() != requestedByContainer {
-				klog.ErrorS(nil, "CPUs already allocated to container with different number than request", "pod", klog.KObj(pod), "containerName", container.Name, "allocatedSize", requested, "requestedByContainer", requestedByContainer, "allocatedSize", allocated.Size())
+				klog.InfoS("CPUs already allocated to container with different number than request", "pod", klog.KObj(pod), "containerName", container.Name, "allocatedSize", requested, "requestedByContainer", requestedByContainer, "allocatedSize", allocated.Size())
 				// An empty list of hints will be treated as a preference that cannot be satisfied.
 				// In definition of hints this is equal to: TopologyHint[NUMANodeAffinity: nil, Preferred: false].
 				// For all but the best-effort policy, the Topology Manager will throw a pod-admission error.

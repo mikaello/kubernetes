@@ -211,7 +211,6 @@ func (p *criStatsProvider) listPodStatsPartiallyFromCRI(ctx context.Context, upd
 		p.addPodNetworkStats(ps, podSandboxID, caInfos, cs, containerNetworkStats[podSandboxID])
 		p.addPodCPUMemoryStats(ps, types.UID(podSandbox.Metadata.Uid), allInfos, cs)
 		p.addSwapStats(ps, types.UID(podSandbox.Metadata.Uid), allInfos, cs)
-		p.addProcessStats(ps, types.UID(podSandbox.Metadata.Uid), allInfos, cs)
 
 		// If cadvisor stats is available for the container, use it to populate
 		// container stats
@@ -220,7 +219,9 @@ func (p *criStatsProvider) listPodStatsPartiallyFromCRI(ctx context.Context, upd
 			klog.V(5).InfoS("Unable to find cadvisor stats for container", "containerID", containerID)
 		} else {
 			p.addCadvisorContainerStats(cs, &caStats)
+			p.addProcessStats(ps, &caStats)
 		}
+
 		ps.Containers = append(ps.Containers, *cs)
 	}
 	// cleanup outdated caches.
@@ -385,10 +386,10 @@ func (p *criStatsProvider) getPodAndContainerMaps(ctx context.Context) (map[stri
 }
 
 // ImageFsStats returns the stats of the image filesystem.
-func (p *criStatsProvider) ImageFsStats(ctx context.Context) (*statsapi.FsStats, error) {
+func (p *criStatsProvider) ImageFsStats(ctx context.Context) (imageFsRet *statsapi.FsStats, containerFsRet *statsapi.FsStats, errRet error) {
 	resp, err := p.imageService.ImageFsInfo(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// CRI may return the stats of multiple image filesystems but we only
@@ -396,31 +397,32 @@ func (p *criStatsProvider) ImageFsStats(ctx context.Context) (*statsapi.FsStats,
 	//
 	// TODO(yguo0905): Support returning stats of multiple image filesystems.
 	if len(resp.GetImageFilesystems()) == 0 {
-		return nil, fmt.Errorf("imageFs information is unavailable")
+		return nil, nil, fmt.Errorf("imageFs information is unavailable")
 	}
 	fs := resp.GetImageFilesystems()[0]
-	s := &statsapi.FsStats{
+	imageFsRet = &statsapi.FsStats{
 		Time:      metav1.NewTime(time.Unix(0, fs.Timestamp)),
 		UsedBytes: &fs.UsedBytes.Value,
 	}
 	if fs.InodesUsed != nil {
-		s.InodesUsed = &fs.InodesUsed.Value
+		imageFsRet.InodesUsed = &fs.InodesUsed.Value
 	}
 	imageFsInfo, err := p.getFsInfo(fs.GetFsId())
 	if err != nil {
-		return nil, fmt.Errorf("get filesystem info: %w", err)
+		return nil, nil, fmt.Errorf("get filesystem info: %w", err)
 	}
 	if imageFsInfo != nil {
 		// The image filesystem id is unknown to the local node or there's
 		// an error on retrieving the stats. In these cases, we omit those
 		// stats and return the best-effort partial result. See
 		// https://github.com/kubernetes/heapster/issues/1793.
-		s.AvailableBytes = &imageFsInfo.Available
-		s.CapacityBytes = &imageFsInfo.Capacity
-		s.InodesFree = imageFsInfo.InodesFree
-		s.Inodes = imageFsInfo.Inodes
+		imageFsRet.AvailableBytes = &imageFsInfo.Available
+		imageFsRet.CapacityBytes = &imageFsInfo.Capacity
+		imageFsRet.InodesFree = imageFsInfo.InodesFree
+		imageFsRet.Inodes = imageFsInfo.Inodes
 	}
-	return s, nil
+	// TODO: For CRI Stats Provider we don't support separate disks yet.
+	return imageFsRet, imageFsRet, nil
 }
 
 // ImageFsDevice returns name of the device where the image filesystem locates,
@@ -583,16 +585,11 @@ func (p *criStatsProvider) addSwapStats(
 
 func (p *criStatsProvider) addProcessStats(
 	ps *statsapi.PodStats,
-	podUID types.UID,
-	allInfos map[string]cadvisorapiv2.ContainerInfo,
-	cs *statsapi.ContainerStats,
+	container *cadvisorapiv2.ContainerInfo,
 ) {
-	// try get process stats from cadvisor only.
-	info := getCadvisorPodInfoFromPodUID(podUID, allInfos)
-	if info != nil {
-		ps.ProcessStats = cadvisorInfoToProcessStats(info)
-		return
-	}
+	processStats := cadvisorInfoToProcessStats(container)
+	// Sum up all of the process stats for each of the containers to obtain the cumulative pod level process count
+	ps.ProcessStats = mergeProcessStats(ps.ProcessStats, processStats)
 }
 
 func (p *criStatsProvider) makeContainerStats(

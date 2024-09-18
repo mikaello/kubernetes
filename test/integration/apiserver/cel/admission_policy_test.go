@@ -29,15 +29,10 @@ import (
 	"k8s.io/api/admission/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
-	genericfeatures "k8s.io/apiserver/pkg/features"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
-
 	apiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/pkg/apis/admissionregistration"
 	admissionregistrationv1alpha1apis "k8s.io/kubernetes/pkg/apis/admissionregistration/v1alpha1"
 	admissionregistrationv1beta1apis "k8s.io/kubernetes/pkg/apis/admissionregistration/v1beta1"
-	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/test/integration/etcd"
 	"k8s.io/kubernetes/test/integration/framework"
 
@@ -410,8 +405,9 @@ func createV1alpha1ValidatingPolicyAndBinding(client clientset.Interface, conver
 // This test tries to mirror very closely the same test for webhook admission
 // test/integration/apiserver/admissionwebhook/admission_test.go testWebhookAdmission
 func TestPolicyAdmission(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.APISelfSubjectReview, true)()
+	// KUBE_APISERVER_SERVE_REMOVED_APIS_FOR_ONE_RELEASE allows for APIs pending removal to not block tests
+	// TODO: Remove this line once admissionregistration v1alpha1 types to be removed in 1.32 are fully removed
+	t.Setenv("KUBE_APISERVER_SERVE_REMOVED_APIS_FOR_ONE_RELEASE", "true")
 
 	holder := &policyExpectationHolder{
 		holder: holder{

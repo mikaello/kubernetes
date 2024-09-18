@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
@@ -200,7 +201,7 @@ func getHugepagesTestPod(f *framework.Framework, limits v1.ResourceList, mounts 
 }
 
 // Serial because the test updates kubelet configuration.
-var _ = SIGDescribe("HugePages [Serial] [Feature:HugePages][NodeSpecialFeature:HugePages]", func() {
+var _ = SIGDescribe("HugePages", framework.WithSerial(), feature.HugePages, "[NodeSpecialFeature:HugePages]", func() {
 	f := framework.NewDefaultFramework("hugepages-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 
@@ -229,7 +230,7 @@ var _ = SIGDescribe("HugePages [Serial] [Feature:HugePages][NodeSpecialFeature:H
 			framework.ExpectNoError(err, "while getting node status")
 			_, isPresent := node.Status.Capacity["hugepages-3Mi"]
 			return isPresent
-		}, 30*time.Second, framework.Poll).Should(gomega.BeFalse())
+		}, 30*time.Second, framework.Poll).Should(gomega.BeFalseBecause("hugepages resource should not be present"))
 	})
 
 	ginkgo.It("should add resources for new huge page sizes on kubelet restart", func(ctx context.Context) {
@@ -249,7 +250,7 @@ var _ = SIGDescribe("HugePages [Serial] [Feature:HugePages][NodeSpecialFeature:H
 			framework.ExpectNoError(err, "while getting node status")
 			_, isPresent := node.Status.Capacity["hugepages-2Mi"]
 			return isPresent
-		}, 30*time.Second, framework.Poll).Should(gomega.BeTrue())
+		}, 30*time.Second, framework.Poll).Should(gomega.BeTrueBecause("hugepages resource should be present"))
 	})
 
 	ginkgo.When("start the pod", func() {

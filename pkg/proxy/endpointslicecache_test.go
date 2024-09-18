@@ -328,7 +328,7 @@ func TestEndpointInfoByServicePort(t *testing.T) {
 	}
 }
 
-func TestEsInfoChanged(t *testing.T) {
+func TestEsDataChanged(t *testing.T) {
 	p80 := int32(80)
 	p443 := int32(443)
 	port80 := discovery.EndpointPort{Port: &p80, Name: ptr.To("http"), Protocol: ptr.To(v1.ProtocolTCP)}
@@ -370,7 +370,7 @@ func TestEsInfoChanged(t *testing.T) {
 				ObjectMeta: objMeta,
 				Ports:      []discovery.EndpointPort{port80, port443},
 			},
-			expectChanged: false,
+			expectChanged: true,
 		},
 		"port removed": {
 			cache: NewEndpointSliceCache("", v1.IPv4Protocol, nil, nil),
@@ -422,7 +422,7 @@ func TestEsInfoChanged(t *testing.T) {
 				Ports:      []discovery.EndpointPort{port443},
 				Endpoints:  []discovery.Endpoint{endpoint2, endpoint1},
 			},
-			expectChanged: false,
+			expectChanged: true,
 		},
 		"identical with endpoint added": {
 			cache: NewEndpointSliceCache("", v1.IPv4Protocol, nil, nil),
@@ -454,11 +454,11 @@ func TestEsInfoChanged(t *testing.T) {
 				t.Fatalf("Expected no error calling endpointSliceCacheKeys(): %v", err)
 			}
 
-			esInfo := newEndpointSliceInfo(tc.updatedSlice, false)
-			changed := tc.cache.esInfoChanged(serviceKey, sliceKey, esInfo)
+			esData := &endpointSliceData{tc.updatedSlice, false}
+			changed := tc.cache.esDataChanged(serviceKey, sliceKey, esData)
 
 			if tc.expectChanged != changed {
-				t.Errorf("Expected esInfoChanged() to return %t, got %t", tc.expectChanged, changed)
+				t.Errorf("Expected esDataChanged() to return %t, got %t", tc.expectChanged, changed)
 			}
 
 			cmc.Check(t)

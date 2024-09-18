@@ -39,6 +39,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/httpstream"
 	"k8s.io/apimachinery/pkg/util/httpstream/wsstream"
 	"k8s.io/apimachinery/pkg/util/remotecommand"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -817,6 +818,8 @@ func TestWebSocketClient_BadHandshake(t *testing.T) {
 // TestWebSocketClient_HeartbeatTimeout tests the heartbeat by forcing a
 // timeout by setting the ping period greater than the deadline.
 func TestWebSocketClient_HeartbeatTimeout(t *testing.T) {
+	blockRequestCtx, unblockRequest := context.WithCancel(context.Background())
+	defer unblockRequest()
 	// Create fake WebSocket server which blocks.
 	websocketServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		conns, err := webSocketServerStreams(req, w, streamOptionsFromRequest(req))
@@ -824,8 +827,7 @@ func TestWebSocketClient_HeartbeatTimeout(t *testing.T) {
 			t.Fatalf("error on webSocketServerStreams: %v", err)
 		}
 		defer conns.conn.Close()
-		// Block server; heartbeat timeout (or test timeout) will fire before this returns.
-		time.Sleep(1 * time.Second)
+		<-blockRequestCtx.Done()
 	}))
 	defer websocketServer.Close()
 	// Create websocket client connecting to fake server.
@@ -840,8 +842,8 @@ func TestWebSocketClient_HeartbeatTimeout(t *testing.T) {
 	}
 	streamExec := exec.(*wsStreamExecutor)
 	// Ping period is greater than the ping deadline, forcing the timeout to fire.
-	pingPeriod := 20 * time.Millisecond
-	pingDeadline := 5 * time.Millisecond
+	pingPeriod := wait.ForeverTestTimeout // this lets the heartbeat deadline expire without renewing it
+	pingDeadline := time.Second           // this gives setup 1 second to establish streams
 	streamExec.heartbeatPeriod = pingPeriod
 	streamExec.heartbeatDeadline = pingDeadline
 	// Send some random data to the websocket server through STDIN.
@@ -859,8 +861,7 @@ func TestWebSocketClient_HeartbeatTimeout(t *testing.T) {
 	}()
 
 	select {
-	case <-time.After(pingPeriod * 5):
-		// Give up after about five ping attempts
+	case <-time.After(wait.ForeverTestTimeout):
 		t.Fatalf("expected heartbeat timeout, got none.")
 	case err := <-errorChan:
 		// Expecting heartbeat timeout error.
@@ -1116,6 +1117,14 @@ func TestWebSocketClient_HeartbeatSucceeds(t *testing.T) {
 	wg.Wait()
 }
 
+func TestLateStreamCreation(t *testing.T) {
+	c := newWSStreamCreator(nil)
+	c.closeAllStreamReaders(nil)
+	if err := c.setStream(0, nil); err == nil {
+		t.Fatal("expected error adding stream after closeAllStreamReaders")
+	}
+}
+
 func TestWebSocketClient_StreamsAndExpectedErrors(t *testing.T) {
 	// Validate Stream functions.
 	c := newWSStreamCreator(nil)
@@ -1331,4 +1340,40 @@ func createWebSocketStreams(req *http.Request, w http.ResponseWriter, opts *opti
 	}(streams[remotecommand.StreamErr])
 
 	return wsStreams, nil
+}
+
+// See (https://github.com/kubernetes/kubernetes/issues/126134).
+func TestWebSocketClient_HTTPSProxyErrorExpected(t *testing.T) {
+	urlStr := "http://127.0.0.1/never-used" + "?" + "stdin=true" + "&" + "stdout=true"
+	websocketLocation, err := url.Parse(urlStr)
+	if err != nil {
+		t.Fatalf("Unable to parse WebSocket server URL: %s", urlStr)
+	}
+	// proxy url with https scheme will trigger websocket dialing error.
+	httpsProxyFunc := func(req *http.Request) (*url.URL, error) { return url.Parse("https://127.0.0.1") }
+	exec, err := NewWebSocketExecutor(&rest.Config{Host: websocketLocation.Host, Proxy: httpsProxyFunc}, "GET", urlStr)
+	if err != nil {
+		t.Errorf("unexpected error creating websocket executor: %v", err)
+	}
+	var stdout bytes.Buffer
+	options := &StreamOptions{
+		Stdout: &stdout,
+	}
+	errorChan := make(chan error)
+	go func() {
+		// Start the streaming on the WebSocket "exec" client.
+		errorChan <- exec.StreamWithContext(context.Background(), *options)
+	}()
+
+	select {
+	case <-time.After(wait.ForeverTestTimeout):
+		t.Fatalf("expect stream to be closed after connection is closed.")
+	case err := <-errorChan:
+		if err == nil {
+			t.Errorf("expected error but received none")
+		}
+		if !httpstream.IsHTTPSProxyError(err) {
+			t.Errorf("expected https proxy error, got (%s)", err)
+		}
+	}
 }

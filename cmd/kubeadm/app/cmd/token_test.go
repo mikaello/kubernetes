@@ -32,9 +32,9 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	bootstraptokenv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/bootstraptoken/v1"
-	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
 	outputapischeme "k8s.io/kubernetes/cmd/kubeadm/app/apis/output/scheme"
-	outputapiv1alpha2 "k8s.io/kubernetes/cmd/kubeadm/app/apis/output/v1alpha2"
+	outputapiv1alpha3 "k8s.io/kubernetes/cmd/kubeadm/app/apis/output/v1alpha3"
 	cmdutil "k8s.io/kubernetes/cmd/kubeadm/app/cmd/util"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/output"
 )
@@ -271,12 +271,12 @@ func TestGetClientSet(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 	fullPath := filepath.Join(tmpDir, testConfigTokenFile)
 
-	// test dryRun = false on a non-exisiting file
+	// test dryRun = false on a non-existing file
 	if _, err = cmdutil.GetClientSet(fullPath, false); err == nil {
 		t.Errorf("GetClientSet(); dry-run: false; did no fail for test file %q: %v", fullPath, err)
 	}
 
-	// test dryRun = true on a non-exisiting file
+	// test dryRun = true on a non-existing file
 	if _, err = cmdutil.GetClientSet(fullPath, true); err == nil {
 		t.Errorf("GetClientSet(); dry-run: true; did no fail for test file %q: %v", fullPath, err)
 	}
@@ -291,7 +291,7 @@ func TestGetClientSet(t *testing.T) {
 		t.Errorf("Unable to write test file %q: %v", fullPath, err)
 	}
 
-	// test dryRun = true on an exisiting file
+	// test dryRun = true on an existing file
 	if _, err = cmdutil.GetClientSet(fullPath, true); err != nil {
 		t.Errorf("GetClientSet(); dry-run: true; failed for test file %q: %v", fullPath, err)
 	}
@@ -355,7 +355,7 @@ func TestTokenOutput(t *testing.T) {
 			outputFormat: "json",
 			expected: `{
     "kind": "BootstrapToken",
-    "apiVersion": "output.kubeadm.k8s.io/v1alpha2",
+    "apiVersion": "output.kubeadm.k8s.io/v1alpha3",
     "token": "abcdef.1234567890123456",
     "description": "valid bootstrap tooken",
     "usages": [
@@ -376,7 +376,7 @@ func TestTokenOutput(t *testing.T) {
 			usages:       []string{"signing", "authentication"},
 			extraGroups:  []string{"system:bootstrappers:kubeadm:default-node-token"},
 			outputFormat: "yaml",
-			expected: `apiVersion: output.kubeadm.k8s.io/v1alpha2
+			expected: `apiVersion: output.kubeadm.k8s.io/v1alpha3
 description: valid bootstrap tooken
 groups:
 - system:bootstrappers:kubeadm:default-node-token
@@ -423,7 +423,7 @@ abcdef.1234567890123456   <forever>   <never>   signing,authentication   valid b
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			token := outputapiv1alpha2.BootstrapToken{
+			token := outputapiv1alpha3.BootstrapToken{
 				BootstrapToken: bootstraptokenv1.BootstrapToken{
 					Token:       &bootstraptokenv1.BootstrapTokenString{ID: tc.id, Secret: tc.secret},
 					Description: tc.description,

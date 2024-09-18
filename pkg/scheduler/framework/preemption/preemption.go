@@ -28,14 +28,12 @@ import (
 	policy "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/apiserver/pkg/util/feature"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	policylisters "k8s.io/client-go/listers/policy/v1"
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/klog/v2"
 	extenderv1 "k8s.io/kube-scheduler/extender/v1"
 	apipod "k8s.io/kubernetes/pkg/api/v1/pod"
-	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/parallelize"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
@@ -110,12 +108,16 @@ type Interface interface {
 	CandidatesToVictimsMap(candidates []Candidate) map[string]*extenderv1.Victims
 	// PodEligibleToPreemptOthers returns one bool and one string. The bool indicates whether this pod should be considered for
 	// preempting other pods or not. The string includes the reason if this pod isn't eligible.
-	PodEligibleToPreemptOthers(pod *v1.Pod, nominatedNodeStatus *framework.Status) (bool, string)
+	PodEligibleToPreemptOthers(ctx context.Context, pod *v1.Pod, nominatedNodeStatus *framework.Status) (bool, string)
 	// SelectVictimsOnNode finds minimum set of pods on the given node that should be preempted in order to make enough room
 	// for "pod" to be scheduled.
 	// Note that both `state` and `nodeInfo` are deep copied.
 	SelectVictimsOnNode(ctx context.Context, state *framework.CycleState,
 		pod *v1.Pod, nodeInfo *framework.NodeInfo, pdbs []*policy.PodDisruptionBudget) ([]*v1.Pod, int, *framework.Status)
+	// OrderedScoreFuncs returns a list of ordered score functions to select preferable node where victims will be preempted.
+	// The ordered score functions will be processed one by one iff we find more than one node with the highest score.
+	// Default score functions will be processed if nil returned here for backwards-compatibility.
+	OrderedScoreFuncs(ctx context.Context, nodesToVictims map[string]*extenderv1.Victims) []func(node string) int64
 }
 
 type Evaluator struct {
@@ -143,7 +145,7 @@ type Evaluator struct {
 //
 //   - <non-nil PostFilterResult, Success>. It's the regular happy path
 //     and the non-empty nominatedNodeName will be applied to the preemptor pod.
-func (ev *Evaluator) Preempt(ctx context.Context, pod *v1.Pod, m framework.NodeToStatusMap) (*framework.PostFilterResult, *framework.Status) {
+func (ev *Evaluator) Preempt(ctx context.Context, pod *v1.Pod, m framework.NodeToStatusReader) (*framework.PostFilterResult, *framework.Status) {
 	logger := klog.FromContext(ctx)
 
 	// 0) Fetch the latest version of <pod>.
@@ -158,13 +160,18 @@ func (ev *Evaluator) Preempt(ctx context.Context, pod *v1.Pod, m framework.NodeT
 	}
 
 	// 1) Ensure the preemptor is eligible to preempt other pods.
-	if ok, msg := ev.PodEligibleToPreemptOthers(pod, m[pod.Status.NominatedNodeName]); !ok {
+	nominatedNodeStatus := m.Get(pod.Status.NominatedNodeName)
+	if ok, msg := ev.PodEligibleToPreemptOthers(ctx, pod, nominatedNodeStatus); !ok {
 		logger.V(5).Info("Pod is not eligible for preemption", "pod", klog.KObj(pod), "reason", msg)
 		return nil, framework.NewStatus(framework.Unschedulable, msg)
 	}
 
 	// 2) Find all preemption candidates.
-	candidates, nodeToStatusMap, err := ev.findCandidates(ctx, pod, m)
+	allNodes, err := ev.Handler.SnapshotSharedLister().NodeInfos().List()
+	if err != nil {
+		return nil, framework.AsStatus(err)
+	}
+	candidates, nodeToStatusMap, err := ev.findCandidates(ctx, allNodes, pod, m)
 	if err != nil && len(candidates) == 0 {
 		return nil, framework.AsStatus(err)
 	}
@@ -173,12 +180,13 @@ func (ev *Evaluator) Preempt(ctx context.Context, pod *v1.Pod, m framework.NodeT
 	if len(candidates) == 0 {
 		fitError := &framework.FitError{
 			Pod:         pod,
-			NumAllNodes: len(nodeToStatusMap),
+			NumAllNodes: len(allNodes),
 			Diagnosis: framework.Diagnosis{
-				NodeToStatusMap: nodeToStatusMap,
+				NodeToStatus: nodeToStatusMap,
 				// Leave UnschedulablePlugins or PendingPlugins as nil as it won't be used on moving Pods.
 			},
 		}
+		fitError.Diagnosis.NodeToStatus.SetAbsentNodesStatus(framework.NewStatus(framework.UnschedulableAndUnresolvable, "Preemption is not helpful for scheduling"))
 		// Specify nominatedNodeName to clear the pod's nominatedNodeName status, if applicable.
 		return framework.NewPostFilterResultWithNominatedNode(""), framework.NewStatus(framework.Unschedulable, fitError.Error())
 	}
@@ -190,7 +198,7 @@ func (ev *Evaluator) Preempt(ctx context.Context, pod *v1.Pod, m framework.NodeT
 	}
 
 	// 4) Find the best candidate.
-	bestCandidate := ev.SelectCandidate(logger, candidates)
+	bestCandidate := ev.SelectCandidate(ctx, candidates)
 	if bestCandidate == nil || len(bestCandidate.Name()) == 0 {
 		return nil, framework.NewStatus(framework.Unschedulable, "no candidate node for preemption")
 	}
@@ -205,16 +213,16 @@ func (ev *Evaluator) Preempt(ctx context.Context, pod *v1.Pod, m framework.NodeT
 
 // FindCandidates calculates a slice of preemption candidates.
 // Each candidate is executable to make the given <pod> schedulable.
-func (ev *Evaluator) findCandidates(ctx context.Context, pod *v1.Pod, m framework.NodeToStatusMap) ([]Candidate, framework.NodeToStatusMap, error) {
-	allNodes, err := ev.Handler.SnapshotSharedLister().NodeInfos().List()
-	if err != nil {
-		return nil, nil, err
-	}
+func (ev *Evaluator) findCandidates(ctx context.Context, allNodes []*framework.NodeInfo, pod *v1.Pod, m framework.NodeToStatusReader) ([]Candidate, *framework.NodeToStatus, error) {
 	if len(allNodes) == 0 {
 		return nil, nil, errors.New("no nodes available")
 	}
 	logger := klog.FromContext(ctx)
-	potentialNodes, unschedulableNodeStatus := nodesWherePreemptionMightHelp(allNodes, m)
+	// Get a list of nodes with failed predicates (Unschedulable) that may be satisfied by removing pods from the node.
+	potentialNodes, err := m.NodesForStatusCode(ev.Handler.SnapshotSharedLister().NodeInfos(), framework.Unschedulable)
+	if err != nil {
+		return nil, nil, err
+	}
 	if len(potentialNodes) == 0 {
 		logger.V(3).Info("Preemption will not help schedule pod on any node", "pod", klog.KObj(pod))
 		// In this case, we should clean-up any existing nominated node name of the pod.
@@ -222,7 +230,7 @@ func (ev *Evaluator) findCandidates(ctx context.Context, pod *v1.Pod, m framewor
 			logger.Error(err, "Could not clear the nominatedNodeName field of pod", "pod", klog.KObj(pod))
 			// We do not return as this error is not critical.
 		}
-		return nil, unschedulableNodeStatus, nil
+		return nil, framework.NewDefaultNodeToStatus(), nil
 	}
 
 	pdbs, err := getPodDisruptionBudgets(ev.PdbLister)
@@ -238,11 +246,7 @@ func (ev *Evaluator) findCandidates(ctx context.Context, pod *v1.Pod, m framewor
 		}
 		loggerV.Info("Selected candidates from a pool of nodes", "potentialNodesCount", len(potentialNodes), "offset", offset, "sampleLength", len(sample), "sample", sample, "candidates", numCandidates)
 	}
-	candidates, nodeStatuses, err := ev.DryRunPreemption(ctx, pod, potentialNodes, pdbs, offset, numCandidates)
-	for node, nodeStatus := range unschedulableNodeStatus {
-		nodeStatuses[node] = nodeStatus
-	}
-	return candidates, nodeStatuses, err
+	return ev.DryRunPreemption(ctx, pod, potentialNodes, pdbs, offset, numCandidates)
 }
 
 // callExtenders calls given <extenders> to select the list of feasible candidates.
@@ -309,7 +313,9 @@ func (ev *Evaluator) callExtenders(logger klog.Logger, pod *v1.Pod, candidates [
 
 // SelectCandidate chooses the best-fit candidate from given <candidates> and return it.
 // NOTE: This method is exported for easier testing in default preemption.
-func (ev *Evaluator) SelectCandidate(logger klog.Logger, candidates []Candidate) Candidate {
+func (ev *Evaluator) SelectCandidate(ctx context.Context, candidates []Candidate) Candidate {
+	logger := klog.FromContext(ctx)
+
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -318,7 +324,8 @@ func (ev *Evaluator) SelectCandidate(logger klog.Logger, candidates []Candidate)
 	}
 
 	victimsMap := ev.CandidatesToVictimsMap(candidates)
-	candidateNode := pickOneNodeForPreemption(logger, victimsMap)
+	scoreFuncs := ev.OrderedScoreFuncs(ctx, victimsMap)
+	candidateNode := pickOneNodeForPreemption(logger, victimsMap, scoreFuncs)
 
 	// Same as candidatesToVictimsMap, this logic is not applicable for out-of-tree
 	// preemption plugins that exercise different candidates on the same nominated node.
@@ -355,21 +362,19 @@ func (ev *Evaluator) prepareCandidate(ctx context.Context, c Candidate, pod *v1.
 			waitingPod.Reject(pluginName, "preempted")
 			logger.V(2).Info("Preemptor pod rejected a waiting pod", "preemptor", klog.KObj(pod), "waitingPod", klog.KObj(victim), "node", c.Name())
 		} else {
-			if feature.DefaultFeatureGate.Enabled(features.PodDisruptionConditions) {
-				condition := &v1.PodCondition{
-					Type:    v1.DisruptionTarget,
-					Status:  v1.ConditionTrue,
-					Reason:  v1.PodReasonPreemptionByScheduler,
-					Message: fmt.Sprintf("%s: preempting to accommodate a higher priority pod", pod.Spec.SchedulerName),
-				}
-				newStatus := pod.Status.DeepCopy()
-				updated := apipod.UpdatePodCondition(newStatus, condition)
-				if updated {
-					if err := util.PatchPodStatus(ctx, cs, victim, newStatus); err != nil {
-						logger.Error(err, "Could not add DisruptionTarget condition due to preemption", "pod", klog.KObj(victim), "preemptor", klog.KObj(pod))
-						errCh.SendErrorWithCancel(err, cancel)
-						return
-					}
+			condition := &v1.PodCondition{
+				Type:    v1.DisruptionTarget,
+				Status:  v1.ConditionTrue,
+				Reason:  v1.PodReasonPreemptionByScheduler,
+				Message: fmt.Sprintf("%s: preempting to accommodate a higher priority pod", pod.Spec.SchedulerName),
+			}
+			newStatus := victim.Status.DeepCopy()
+			updated := apipod.UpdatePodCondition(newStatus, condition)
+			if updated {
+				if err := util.PatchPodStatus(ctx, cs, victim, newStatus); err != nil {
+					logger.Error(err, "Could not add DisruptionTarget condition due to preemption", "pod", klog.KObj(victim), "preemptor", klog.KObj(pod))
+					errCh.SendErrorWithCancel(err, cancel)
+					return
 				}
 			}
 			if err := util.DeletePod(ctx, cs, victim); err != nil {
@@ -403,24 +408,6 @@ func (ev *Evaluator) prepareCandidate(ctx context.Context, c Candidate, pod *v1.
 	return nil
 }
 
-// nodesWherePreemptionMightHelp returns a list of nodes with failed predicates
-// that may be satisfied by removing pods from the node.
-func nodesWherePreemptionMightHelp(nodes []*framework.NodeInfo, m framework.NodeToStatusMap) ([]*framework.NodeInfo, framework.NodeToStatusMap) {
-	var potentialNodes []*framework.NodeInfo
-	nodeStatuses := make(framework.NodeToStatusMap)
-	for _, node := range nodes {
-		name := node.Node().Name
-		// We rely on the status by each plugin - 'Unschedulable' or 'UnschedulableAndUnresolvable'
-		// to determine whether preemption may help or not on the node.
-		if m[name].Code() == framework.UnschedulableAndUnresolvable {
-			nodeStatuses[node.Node().Name] = framework.NewStatus(framework.UnschedulableAndUnresolvable, "Preemption is not helpful for scheduling")
-			continue
-		}
-		potentialNodes = append(potentialNodes, node)
-	}
-	return potentialNodes, nodeStatuses
-}
-
 func getPodDisruptionBudgets(pdbLister policylisters.PodDisruptionBudgetLister) ([]*policy.PodDisruptionBudget, error) {
 	if pdbLister != nil {
 		return pdbLister.List(labels.Everything())
@@ -428,8 +415,10 @@ func getPodDisruptionBudgets(pdbLister policylisters.PodDisruptionBudgetLister) 
 	return nil, nil
 }
 
-// pickOneNodeForPreemption chooses one node among the given nodes. It assumes
-// pods in each map entry are ordered by decreasing priority.
+// pickOneNodeForPreemption chooses one node among the given nodes.
+// It assumes pods in each map entry are ordered by decreasing priority.
+// If the scoreFuns is not empty, It picks a node based on score scoreFuns returns.
+// If the scoreFuns is empty,
 // It picks a node based on the following criteria:
 // 1. A node with minimum number of PDB violations.
 // 2. A node with minimum highest priority victim is picked.
@@ -439,7 +428,7 @@ func getPodDisruptionBudgets(pdbLister policylisters.PodDisruptionBudgetLister) 
 // 6. If there are still ties, the first such node is picked (sort of randomly).
 // The 'minNodes1' and 'minNodes2' are being reused here to save the memory
 // allocation and garbage collection time.
-func pickOneNodeForPreemption(logger klog.Logger, nodesToVictims map[string]*extenderv1.Victims) string {
+func pickOneNodeForPreemption(logger klog.Logger, nodesToVictims map[string]*extenderv1.Victims, scoreFuncs []func(node string) int64) string {
 	if len(nodesToVictims) == 0 {
 		return ""
 	}
@@ -449,58 +438,60 @@ func pickOneNodeForPreemption(logger klog.Logger, nodesToVictims map[string]*ext
 		allCandidates = append(allCandidates, node)
 	}
 
-	minNumPDBViolatingScoreFunc := func(node string) int64 {
-		// The smaller the NumPDBViolations, the higher the score.
-		return -nodesToVictims[node].NumPDBViolations
-	}
-	minHighestPriorityScoreFunc := func(node string) int64 {
-		// highestPodPriority is the highest priority among the victims on this node.
-		highestPodPriority := corev1helpers.PodPriority(nodesToVictims[node].Pods[0])
-		// The smaller the highestPodPriority, the higher the score.
-		return -int64(highestPodPriority)
-	}
-	minSumPrioritiesScoreFunc := func(node string) int64 {
-		var sumPriorities int64
-		for _, pod := range nodesToVictims[node].Pods {
-			// We add MaxInt32+1 to all priorities to make all of them >= 0. This is
-			// needed so that a node with a few pods with negative priority is not
-			// picked over a node with a smaller number of pods with the same negative
-			// priority (and similar scenarios).
-			sumPriorities += int64(corev1helpers.PodPriority(pod)) + int64(math.MaxInt32+1)
+	if len(scoreFuncs) == 0 {
+		minNumPDBViolatingScoreFunc := func(node string) int64 {
+			// The smaller the NumPDBViolations, the higher the score.
+			return -nodesToVictims[node].NumPDBViolations
 		}
-		// The smaller the sumPriorities, the higher the score.
-		return -sumPriorities
-	}
-	minNumPodsScoreFunc := func(node string) int64 {
-		// The smaller the length of pods, the higher the score.
-		return -int64(len(nodesToVictims[node].Pods))
-	}
-	latestStartTimeScoreFunc := func(node string) int64 {
-		// Get earliest start time of all pods on the current node.
-		earliestStartTimeOnNode := util.GetEarliestPodStartTime(nodesToVictims[node])
-		if earliestStartTimeOnNode == nil {
-			logger.Error(errors.New("earliestStartTime is nil for node"), "Should not reach here", "node", node)
-			return int64(math.MinInt64)
+		minHighestPriorityScoreFunc := func(node string) int64 {
+			// highestPodPriority is the highest priority among the victims on this node.
+			highestPodPriority := corev1helpers.PodPriority(nodesToVictims[node].Pods[0])
+			// The smaller the highestPodPriority, the higher the score.
+			return -int64(highestPodPriority)
 		}
-		// The bigger the earliestStartTimeOnNode, the higher the score.
-		return earliestStartTimeOnNode.UnixNano()
-	}
+		minSumPrioritiesScoreFunc := func(node string) int64 {
+			var sumPriorities int64
+			for _, pod := range nodesToVictims[node].Pods {
+				// We add MaxInt32+1 to all priorities to make all of them >= 0. This is
+				// needed so that a node with a few pods with negative priority is not
+				// picked over a node with a smaller number of pods with the same negative
+				// priority (and similar scenarios).
+				sumPriorities += int64(corev1helpers.PodPriority(pod)) + int64(math.MaxInt32+1)
+			}
+			// The smaller the sumPriorities, the higher the score.
+			return -sumPriorities
+		}
+		minNumPodsScoreFunc := func(node string) int64 {
+			// The smaller the length of pods, the higher the score.
+			return -int64(len(nodesToVictims[node].Pods))
+		}
+		latestStartTimeScoreFunc := func(node string) int64 {
+			// Get the earliest start time of all pods on the current node.
+			earliestStartTimeOnNode := util.GetEarliestPodStartTime(nodesToVictims[node])
+			if earliestStartTimeOnNode == nil {
+				logger.Error(errors.New("earliestStartTime is nil for node"), "Should not reach here", "node", node)
+				return int64(math.MinInt64)
+			}
+			// The bigger the earliestStartTimeOnNode, the higher the score.
+			return earliestStartTimeOnNode.UnixNano()
+		}
 
-	// Each scoreFunc scores the nodes according to specific rules and keeps the name of the node
-	// with the highest score. If and only if the scoreFunc has more than one node with the highest
-	// score, we will execute the other scoreFunc in order of precedence.
-	scoreFuncs := []func(string) int64{
-		// A node with a minimum number of PDB is preferable.
-		minNumPDBViolatingScoreFunc,
-		// A node with a minimum highest priority victim is preferable.
-		minHighestPriorityScoreFunc,
-		// A node with the smallest sum of priorities is preferable.
-		minSumPrioritiesScoreFunc,
-		// A node with the minimum number of pods is preferable.
-		minNumPodsScoreFunc,
-		// A node with the latest start time of all highest priority victims is preferable.
-		latestStartTimeScoreFunc,
-		// If there are still ties, then the first Node in the list is selected.
+		// Each scoreFunc scores the nodes according to specific rules and keeps the name of the node
+		// with the highest score. If and only if the scoreFunc has more than one node with the highest
+		// score, we will execute the other scoreFunc in order of precedence.
+		scoreFuncs = []func(string) int64{
+			// A node with a minimum number of PDB is preferable.
+			minNumPDBViolatingScoreFunc,
+			// A node with a minimum highest priority victim is preferable.
+			minHighestPriorityScoreFunc,
+			// A node with the smallest sum of priorities is preferable.
+			minSumPrioritiesScoreFunc,
+			// A node with the minimum number of pods is preferable.
+			minNumPodsScoreFunc,
+			// A node with the latest start time of all highest priority victims is preferable.
+			latestStartTimeScoreFunc,
+			// If there are still ties, then the first Node in the list is selected.
+		}
 	}
 
 	for _, f := range scoreFuncs {
@@ -555,13 +546,14 @@ func getLowerPriorityNominatedPods(logger klog.Logger, pn framework.PodNominator
 // candidates, ones that do not violate PDB are preferred over ones that do.
 // NOTE: This method is exported for easier testing in default preemption.
 func (ev *Evaluator) DryRunPreemption(ctx context.Context, pod *v1.Pod, potentialNodes []*framework.NodeInfo,
-	pdbs []*policy.PodDisruptionBudget, offset int32, numCandidates int32) ([]Candidate, framework.NodeToStatusMap, error) {
+	pdbs []*policy.PodDisruptionBudget, offset int32, numCandidates int32) ([]Candidate, *framework.NodeToStatus, error) {
+
 	fh := ev.Handler
 	nonViolatingCandidates := newCandidateList(numCandidates)
 	violatingCandidates := newCandidateList(numCandidates)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	nodeStatuses := make(framework.NodeToStatusMap)
+	nodeStatuses := framework.NewDefaultNodeToStatus()
 	var statusesLock sync.Mutex
 	var errs []error
 	checkNode := func(i int) {
@@ -595,7 +587,7 @@ func (ev *Evaluator) DryRunPreemption(ctx context.Context, pod *v1.Pod, potentia
 		if status.Code() == framework.Error {
 			errs = append(errs, status.AsError())
 		}
-		nodeStatuses[nodeInfoCopy.Node().Name] = status
+		nodeStatuses.Set(nodeInfoCopy.Node().Name, status)
 		statusesLock.Unlock()
 	}
 	fh.Parallelizer().Until(ctx, len(potentialNodes), checkNode, ev.PluginName)

@@ -17,14 +17,30 @@ limitations under the License.
 package config
 
 import (
-	"fmt"
-	"sort"
-	"strings"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	componentbaseconfig "k8s.io/component-base/config"
 	logsapi "k8s.io/component-base/logs/api/v1"
 )
+
+// KubeProxyLinuxConfiguration contains Linux platform related configuration details for the
+// Kubernetes proxy server that aren't specific to a particular backend.
+type KubeProxyLinuxConfiguration struct {
+	// conntrack contains conntrack-related configuration options.
+	Conntrack KubeProxyConntrackConfiguration
+	// masqueradeAll tells kube-proxy to SNAT all traffic sent to Service cluster IPs. This may
+	// be required with some CNI plugins.
+	MasqueradeAll bool
+	// oomScoreAdj is the oom-score-adj value for kube-proxy process. Values must be within
+	// the range [-1000, 1000]
+	OOMScoreAdj *int32
+}
+
+// KubeProxyWindowsConfiguration contains Windows platform related configuration details for the
+// Kubernetes proxy server that aren't specific to a particular backend
+type KubeProxyWindowsConfiguration struct {
+	// runAsService, if true, enables Windows service control manager API integration.
+	RunAsService bool
+}
 
 // KubeProxyIPTablesConfiguration contains iptables-related configuration
 // details for the Kubernetes proxy server.
@@ -32,36 +48,16 @@ type KubeProxyIPTablesConfiguration struct {
 	// masqueradeBit is the bit of the iptables fwmark space to use for SNAT if using
 	// the iptables or ipvs proxy mode. Values must be within the range [0, 31].
 	MasqueradeBit *int32
-	// masqueradeAll tells kube-proxy to SNAT all traffic sent to Service cluster IPs,
-	// when using the iptables or ipvs proxy mode. This may be required with some CNI
-	// plugins.
-	MasqueradeAll bool
 	// localhostNodePorts, if false, tells kube-proxy to disable the legacy behavior
 	// of allowing NodePort services to be accessed via localhost. (Applies only to
 	// iptables mode and IPv4; localhost NodePorts are never allowed with other proxy
 	// modes or with IPv6.)
 	LocalhostNodePorts *bool
-	// syncPeriod is an interval (e.g. '5s', '1m', '2h22m') indicating how frequently
-	// various re-synchronizing and cleanup operations are performed. Must be greater
-	// than 0.
-	SyncPeriod metav1.Duration
-	// minSyncPeriod is the minimum period between iptables rule resyncs (e.g. '5s',
-	// '1m', '2h22m'). A value of 0 means every Service or EndpointSlice change will
-	// result in an immediate iptables resync.
-	MinSyncPeriod metav1.Duration
 }
 
 // KubeProxyIPVSConfiguration contains ipvs-related configuration
 // details for the Kubernetes proxy server.
 type KubeProxyIPVSConfiguration struct {
-	// syncPeriod is an interval (e.g. '5s', '1m', '2h22m') indicating how frequently
-	// various re-synchronizing and cleanup operations are performed. Must be greater
-	// than 0.
-	SyncPeriod metav1.Duration
-	// minSyncPeriod is the minimum period between IPVS rule resyncs (e.g. '5s', '1m',
-	// '2h22m'). A value of 0 means every Service or EndpointSlice change will result
-	// in an immediate IPVS resync.
-	MinSyncPeriod metav1.Duration
 	// scheduler is the IPVS scheduler to use
 	Scheduler string
 	// excludeCIDRs is a list of CIDRs which the ipvs proxier should not touch
@@ -81,6 +77,14 @@ type KubeProxyIPVSConfiguration struct {
 	UDPTimeout metav1.Duration
 }
 
+// KubeProxyNFTablesConfiguration contains nftables-related configuration
+// details for the Kubernetes proxy server.
+type KubeProxyNFTablesConfiguration struct {
+	// masqueradeBit is the bit of the iptables fwmark space to use for SNAT if using
+	// the nftables proxy mode. Values must be within the range [0, 31].
+	MasqueradeBit *int32
+}
+
 // KubeProxyConntrackConfiguration contains conntrack settings for
 // the Kubernetes proxy server.
 type KubeProxyConntrackConfiguration struct {
@@ -97,6 +101,10 @@ type KubeProxyConntrackConfiguration struct {
 	// in CLOSE_WAIT state will remain in the conntrack
 	// table. (e.g. '60s'). Must be greater than 0 to set.
 	TCPCloseWaitTimeout *metav1.Duration
+	// tcpBeLiberal, if true, kube-proxy will configure conntrack
+	// to run in liberal mode for TCP connections and packets with
+	// out-of-window sequence numbers won't be marked INVALID.
+	TCPBeLiberal bool
 	// udpTimeout is how long an idle UDP conntrack entry in
 	// UNREPLIED state will remain in the conntrack table
 	// (e.g. '30s'). Must be greater than 0 to set.
@@ -133,6 +141,10 @@ type DetectLocalConfiguration struct {
 	// LocalModeBridgeInterface, kube-proxy will consider traffic to be local if
 	// it originates from this bridge.
 	BridgeInterface string
+	// clusterCIDRs is the dual-stack list of CIDR ranges of the pods in the cluster. When
+	// DetectLocalMode is set to LocalModeClusterCIDR, kube-proxy will consider
+	// traffic to be local if its source IP is in the range of any given CIDR.
+	ClusterCIDRs []string
 	// interfaceNamePrefix is an interface name prefix. When DetectLocalMode is set to
 	// LocalModeInterfaceNamePrefix, kube-proxy will consider traffic to be local if
 	// it originates from any interface whose name begins with this prefix.
@@ -145,6 +157,12 @@ type DetectLocalConfiguration struct {
 // Kubernetes proxy server.
 type KubeProxyConfiguration struct {
 	metav1.TypeMeta
+
+	// linux contains Linux-related configuration options.
+	Linux KubeProxyLinuxConfiguration
+
+	// windows contains Windows-related configuration options.
+	Windows KubeProxyWindowsConfiguration
 
 	// featureGates is a map of feature names to bools that enable or disable alpha/experimental features.
 	FeatureGates map[string]bool
@@ -191,41 +209,39 @@ type KubeProxyConfiguration struct {
 	IPVS KubeProxyIPVSConfiguration
 	// winkernel contains winkernel-related configuration options.
 	Winkernel KubeProxyWinkernelConfiguration
+	// nftables contains nftables-related configuration options.
+	NFTables KubeProxyNFTablesConfiguration
 
 	// detectLocalMode determines mode to use for detecting local traffic, defaults to LocalModeClusterCIDR
 	DetectLocalMode LocalMode
 	// detectLocal contains optional configuration settings related to DetectLocalMode.
 	DetectLocal DetectLocalConfiguration
-	// clusterCIDR is the CIDR range of the pods in the cluster. (For dual-stack
-	// clusters, this can be a comma-separated dual-stack pair of CIDR ranges.). When
-	// DetectLocalMode is set to LocalModeClusterCIDR, kube-proxy will consider
-	// traffic to be local if its source IP is in this range. (Otherwise it is not
-	// used.)
-	ClusterCIDR string
 
-	// nodePortAddresses is a list of CIDR ranges that contain valid node IPs. If set,
+	// nodePortAddresses is a list of CIDR ranges that contain valid node IPs, or
+	// alternatively, the single string 'primary'. If set to a list of CIDRs,
 	// connections to NodePort services will only be accepted on node IPs in one of
-	// the indicated ranges. If unset, NodePort connections will be accepted on all
-	// local IPs.
+	// the indicated ranges. If set to 'primary', NodePort services will only be
+	// accepted on the node's primary IPv4 and/or IPv6 address according to the Node
+	// object. If unset, NodePort connections will be accepted on all local IPs.
 	NodePortAddresses []string
 
-	// oomScoreAdj is the oom-score-adj value for kube-proxy process. Values must be within
-	// the range [-1000, 1000]
-	OOMScoreAdj *int32
-	// conntrack contains conntrack-related configuration options.
-	Conntrack KubeProxyConntrackConfiguration
+	// syncPeriod is an interval (e.g. '5s', '1m', '2h22m') indicating how frequently
+	// various re-synchronizing and cleanup operations are performed. Must be greater
+	// than 0.
+	SyncPeriod metav1.Duration
+	// minSyncPeriod is the minimum period between proxier rule resyncs (e.g. '5s',
+	// '1m', '2h22m'). A value of 0 means every Service or EndpointSlice change will
+	// result in an immediate proxier resync.
+	MinSyncPeriod metav1.Duration
 	// configSyncPeriod is how often configuration from the apiserver is refreshed. Must be greater
 	// than 0.
 	ConfigSyncPeriod metav1.Duration
-
-	// portRange was previously used to configure the userspace proxy, but is now unused.
-	PortRange string
 }
 
 // ProxyMode represents modes used by the Kubernetes proxy server.
 //
-// Currently, two modes of proxy are available on Linux platforms: 'iptables' and 'ipvs'.
-// One mode of proxy is available on Windows platforms: 'kernelspace'.
+// Currently, three modes of proxy are available on Linux platforms: 'iptables', 'ipvs',
+// and 'nftables'. One mode of proxy is available on Windows platforms: 'kernelspace'.
 //
 // If the proxy mode is unspecified, the best-available proxy mode will be used (currently this
 // is `iptables` on Linux and `kernelspace` on Windows). If the selected proxy mode cannot be
@@ -236,18 +252,8 @@ type ProxyMode string
 const (
 	ProxyModeIPTables    ProxyMode = "iptables"
 	ProxyModeIPVS        ProxyMode = "ipvs"
+	ProxyModeNFTables    ProxyMode = "nftables"
 	ProxyModeKernelspace ProxyMode = "kernelspace"
-)
-
-// LocalMode represents modes to detect local traffic from the node
-type LocalMode string
-
-// Currently supported modes for LocalMode
-const (
-	LocalModeClusterCIDR         LocalMode = "ClusterCIDR"
-	LocalModeNodeCIDR            LocalMode = "NodeCIDR"
-	LocalModeBridgeInterface     LocalMode = "BridgeInterface"
-	LocalModeInterfaceNamePrefix LocalMode = "InterfaceNamePrefix"
 )
 
 func (m *ProxyMode) Set(s string) error {
@@ -266,6 +272,17 @@ func (m *ProxyMode) Type() string {
 	return "ProxyMode"
 }
 
+// LocalMode represents modes to detect local traffic from the node
+type LocalMode string
+
+// Currently supported modes for LocalMode
+const (
+	LocalModeClusterCIDR         LocalMode = "ClusterCIDR"
+	LocalModeNodeCIDR            LocalMode = "NodeCIDR"
+	LocalModeBridgeInterface     LocalMode = "BridgeInterface"
+	LocalModeInterfaceNamePrefix LocalMode = "InterfaceNamePrefix"
+)
+
 func (m *LocalMode) Set(s string) error {
 	*m = LocalMode(s)
 	return nil
@@ -282,32 +299,6 @@ func (m *LocalMode) Type() string {
 	return "LocalMode"
 }
 
-type ConfigurationMap map[string]string
-
-func (m *ConfigurationMap) String() string {
-	pairs := []string{}
-	for k, v := range *m {
-		pairs = append(pairs, fmt.Sprintf("%s=%s", k, v))
-	}
-	sort.Strings(pairs)
-	return strings.Join(pairs, ",")
-}
-
-func (m *ConfigurationMap) Set(value string) error {
-	for _, s := range strings.Split(value, ",") {
-		if len(s) == 0 {
-			continue
-		}
-		arr := strings.SplitN(s, "=", 2)
-		if len(arr) == 2 {
-			(*m)[strings.TrimSpace(arr[0])] = strings.TrimSpace(arr[1])
-		} else {
-			(*m)[strings.TrimSpace(arr[0])] = ""
-		}
-	}
-	return nil
-}
-
-func (*ConfigurationMap) Type() string {
-	return "mapStringString"
-}
+// NodePortAddressesPrimary is a special value for NodePortAddresses indicating that it
+// should only use the primary node IPs.
+const NodePortAddressesPrimary string = "primary"

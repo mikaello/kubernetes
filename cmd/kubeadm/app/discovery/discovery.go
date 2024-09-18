@@ -25,7 +25,7 @@ import (
 	"k8s.io/klog/v2"
 
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
-	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
 	"k8s.io/kubernetes/cmd/kubeadm/app/discovery/file"
 	"k8s.io/kubernetes/cmd/kubeadm/app/discovery/https"
 	"k8s.io/kubernetes/cmd/kubeadm/app/discovery/token"
@@ -61,26 +61,27 @@ func For(cfg *kubeadmapi.JoinConfiguration) (*clientcmdapi.Config, error) {
 		), nil
 	}
 
-	// if the config returned from discovery has authentication credentials, proceed with the TLS boostrap process
+	// if the config returned from discovery has authentication credentials, proceed with the TLS bootstrap process
 	if kubeconfigutil.HasAuthenticationCredentials(config) {
 		return config, nil
 	}
 
 	// if there are no authentication credentials (nor in the config returned from discovery, nor in the TLSBootstrapToken), fail
-	return nil, errors.New("couldn't find authentication credentials for the TLS boostrap process. Please use Token discovery, a discovery file with embedded authentication credentials or a discovery file without authentication credentials but with the TLSBootstrapToken flag")
+	return nil, errors.New("couldn't find authentication credentials for the TLS bootstrap process. Please use Token discovery, a discovery file with embedded authentication credentials or a discovery file without authentication credentials but with the TLSBootstrapToken flag")
 }
 
 // DiscoverValidatedKubeConfig returns a validated Config object that specifies where the cluster is and the CA cert to trust
 func DiscoverValidatedKubeConfig(cfg *kubeadmapi.JoinConfiguration) (*clientcmdapi.Config, error) {
+	timeout := cfg.Timeouts.Discovery.Duration
 	switch {
 	case cfg.Discovery.File != nil:
 		kubeConfigPath := cfg.Discovery.File.KubeConfigPath
 		if isHTTPSURL(kubeConfigPath) {
-			return https.RetrieveValidatedConfigInfo(kubeConfigPath, cfg.Discovery.Timeout.Duration)
+			return https.RetrieveValidatedConfigInfo(kubeConfigPath, timeout)
 		}
-		return file.RetrieveValidatedConfigInfo(kubeConfigPath, cfg.Discovery.Timeout.Duration)
+		return file.RetrieveValidatedConfigInfo(kubeConfigPath, timeout)
 	case cfg.Discovery.BootstrapToken != nil:
-		return token.RetrieveValidatedConfigInfo(&cfg.Discovery)
+		return token.RetrieveValidatedConfigInfo(&cfg.Discovery, timeout)
 	default:
 		return nil, errors.New("couldn't find a valid discovery configuration")
 	}

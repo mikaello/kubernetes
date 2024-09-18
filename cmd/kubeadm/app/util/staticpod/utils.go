@@ -151,22 +151,6 @@ func VolumeMountMapToSlice(volumeMounts map[string]v1.VolumeMount) []v1.VolumeMo
 	return v
 }
 
-// GetExtraParameters builds a list of flag arguments two string-string maps, one with default, base commands and one with overrides
-func GetExtraParameters(overrides map[string]string, defaults map[string]string) []string {
-	var command []string
-	for k, v := range overrides {
-		if len(v) > 0 {
-			command = append(command, fmt.Sprintf("--%s=%s", k, v))
-		}
-	}
-	for k, v := range defaults {
-		if _, overrideExists := overrides[k]; !overrideExists {
-			command = append(command, fmt.Sprintf("--%s=%s", k, v))
-		}
-	}
-	return command
-}
-
 // PatchStaticPod applies patches stored in patchesDir to a static Pod.
 func PatchStaticPod(pod *v1.Pod, patchesDir string, output io.Writer) (*v1.Pod, error) {
 	// Marshal the Pod manifest into YAML.
@@ -260,7 +244,7 @@ func ReadinessProbe(host, path string, port int32, scheme v1.URIScheme) *v1.Prob
 
 // StartupProbe creates a Probe object with a HTTPGet handler
 func StartupProbe(host, path string, port int32, scheme v1.URIScheme, timeoutForControlPlane *metav1.Duration) *v1.Probe {
-	periodSeconds, timeoutForControlPlaneSeconds := int32(10), kubeadmconstants.DefaultControlPlaneTimeout.Seconds()
+	periodSeconds, timeoutForControlPlaneSeconds := int32(10), kubeadmconstants.ControlPlaneComponentHealthCheckTimeout.Seconds()
 	if timeoutForControlPlane != nil {
 		timeoutForControlPlaneSeconds = timeoutForControlPlane.Seconds()
 	}

@@ -148,7 +148,7 @@ func ConformanceIt(args ...interface{}) bool {
 
 // It is a wrapper around [ginkgo.It] which supports framework With* labels as
 // optional arguments in addition to those already supported by ginkgo itself,
-// like [ginkgo.Label] and [gingko.Offset].
+// like [ginkgo.Label] and [ginkgo.Offset].
 //
 // Text and arguments may be mixed. The final text is a concatenation
 // of the text arguments and special tags from the With functions.
@@ -163,7 +163,7 @@ func (f *Framework) It(args ...interface{}) bool {
 
 // Describe is a wrapper around [ginkgo.Describe] which supports framework
 // With* labels as optional arguments in addition to those already supported by
-// ginkgo itself, like [ginkgo.Label] and [gingko.Offset].
+// ginkgo itself, like [ginkgo.Label] and [ginkgo.Offset].
 //
 // Text and arguments may be mixed. The final text is a concatenation
 // of the text arguments and special tags from the With functions.
@@ -178,7 +178,7 @@ func (f *Framework) Describe(args ...interface{}) bool {
 
 // Context is a wrapper around [ginkgo.Context] which supports framework With*
 // labels as optional arguments in addition to those already supported by
-// ginkgo itself, like [ginkgo.Label] and [gingko.Offset].
+// ginkgo itself, like [ginkgo.Label] and [ginkgo.Offset].
 //
 // Text and arguments may be mixed. The final text is a concatenation
 // of the text arguments and special tags from the With functions.
@@ -209,8 +209,9 @@ func registerInSuite(ginkgoCall func(string, ...interface{}) bool, args []interf
 		case label:
 			fullLabel := strings.Join(arg.parts, ":")
 			addLabel(fullLabel)
-			if arg.extra != "" {
-				addLabel(arg.extra)
+			if arg.extraFeature != "" {
+				texts = append(texts, fmt.Sprintf("[%s]", arg.extraFeature))
+				ginkgoArgs = append(ginkgoArgs, ginkgo.Label("Feature:"+arg.extraFeature))
 			}
 			if fullLabel == "Serial" {
 				ginkgoArgs = append(ginkgoArgs, ginkgo.Serial)
@@ -246,6 +247,88 @@ func registerInSuite(ginkgoCall func(string, ...interface{}) bool, args []interf
 	return ginkgoCall(text, ginkgoArgs...)
 }
 
+var (
+	tagRe                 = regexp.MustCompile(`\[.*?\]`)
+	deprecatedTags        = sets.New("Conformance", "Flaky", "NodeConformance", "Disruptive", "Serial", "Slow")
+	deprecatedTagPrefixes = sets.New("Environment", "Feature", "NodeFeature", "FeatureGate")
+	deprecatedStability   = sets.New("Alpha", "Beta")
+)
+
+// validateSpecs checks that the test specs were registered as intended.
+func validateSpecs(specs types.SpecReports) {
+	checked := sets.New[call]()
+
+	for _, spec := range specs {
+		for i, text := range spec.ContainerHierarchyTexts {
+			c := call{
+				text:     text,
+				location: spec.ContainerHierarchyLocations[i],
+			}
+			if checked.Has(c) {
+				// No need to check the same container more than once.
+				continue
+			}
+			checked.Insert(c)
+			validateText(c.location, text, spec.ContainerHierarchyLabels[i])
+		}
+		c := call{
+			text:     spec.LeafNodeText,
+			location: spec.LeafNodeLocation,
+		}
+		if !checked.Has(c) {
+			validateText(spec.LeafNodeLocation, spec.LeafNodeText, spec.LeafNodeLabels)
+			checked.Insert(c)
+		}
+	}
+}
+
+// call acts as (mostly) unique identifier for a container node call like
+// Describe or Context. It's not perfect because theoretically a line might
+// have multiple calls with the same text, but that isn't a problem in
+// practice.
+type call struct {
+	text     string
+	location types.CodeLocation
+}
+
+// validateText checks for some known tags that should not be added through the
+// plain text strings anymore. Eventually, all such tags should get replaced
+// with the new APIs.
+func validateText(location types.CodeLocation, text string, labels []string) {
+	for _, tag := range tagRe.FindAllString(text, -1) {
+		if tag == "[]" {
+			recordTextBug(location, "[] in plain text is invalid")
+			continue
+		}
+		// Strip square brackets.
+		tag = tag[1 : len(tag)-1]
+		if slices.Contains(labels, tag) {
+			// Okay, was also set as label.
+			continue
+		}
+		if deprecatedTags.Has(tag) {
+			recordTextBug(location, fmt.Sprintf("[%s] in plain text is deprecated and must be added through With%s instead", tag, tag))
+		}
+		if deprecatedStability.Has(tag) {
+			if slices.Contains(labels, "Feature:"+tag) {
+				// Okay, was also set as label.
+				continue
+			}
+			recordTextBug(location, fmt.Sprintf("[%s] in plain text is deprecated and must be added by defining the feature gate through WithFeatureGate instead", tag))
+		}
+		if index := strings.Index(tag, ":"); index > 0 {
+			prefix := tag[:index]
+			if deprecatedTagPrefixes.Has(prefix) {
+				recordTextBug(location, fmt.Sprintf("[%s] in plain text is deprecated and must be added through With%s(%s) instead", tag, prefix, tag[index+1:]))
+			}
+		}
+	}
+}
+
+func recordTextBug(location types.CodeLocation, message string) {
+	RecordBug(Bug{FileName: location.FileName, LineNumber: location.LineNumber, Message: message})
+}
+
 // WithEnvironment specifies that a certain test or group of tests only works
 // with a feature available. The return value must be passed as additional
 // argument to [framework.It], [framework.Describe], [framework.Context].
@@ -275,6 +358,16 @@ func withFeature(name Feature) interface{} {
 // [k8s.io/apiserver/pkg/util/feature.DefaultMutableFeatureGate]. Once a
 // feature gate gets removed from there, the WithFeatureGate calls using it
 // also need to be removed.
+//
+// [Alpha] resp. [Beta] get added to the test name automatically depending
+// on the current stability level of the feature. Feature:Alpha resp.
+// Feature:Beta get added to the Ginkgo labels because this is a special
+// requirement for how the cluster needs to be configured.
+//
+// If the test can run in any cluster that has alpha resp. beta features and
+// API groups enabled, then annotating it with just WithFeatureGate is
+// sufficient. Otherwise, WithFeature has to be used to define the additional
+// requirements.
 func WithFeatureGate(featureGate featuregate.Feature) interface{} {
 	return withFeatureGate(featureGate)
 }
@@ -298,7 +391,7 @@ func withFeatureGate(featureGate featuregate.Feature) interface{} {
 	}
 
 	l := newLabel("FeatureGate", string(featureGate))
-	l.extra = level
+	l.extraFeature = level
 	return l
 }
 
@@ -448,15 +541,38 @@ func withLabel(label string) interface{} {
 	return newLabel(label)
 }
 
+// WithFlaky specifies that a certain test or group of tests are failing randomly.
+// These tests are usually filtered out and ran separately from other tests.
+func WithFlaky() interface{} {
+	return withFlaky()
+}
+
+// WithFlaky is a shorthand for the corresponding package function.
+func (f *Framework) WithFlaky() interface{} {
+	return withFlaky()
+}
+
+func withFlaky() interface{} {
+	return newLabel("Flaky")
+}
+
 type label struct {
 	// parts get concatenated with ":" to build the full label.
 	parts []string
-	// extra is an optional fully-formed extra label.
-	extra string
+	// extra is an optional feature name. It gets added as [<extraFeature>]
+	// to the test name and as Feature:<extraFeature> to the labels.
+	extraFeature string
+	// explanation gets set for each label to help developers
+	// who pass a label to a ginkgo function. They need to use
+	// the corresponding framework function instead.
+	explanation string
 }
 
 func newLabel(parts ...string) label {
-	return label{parts: parts}
+	return label{
+		parts:       parts,
+		explanation: "If you see this as part of an 'Unknown Decorator' error from Ginkgo, then you need to replace the ginkgo.It/Context/Describe call with the corresponding framework.It/Context/Describe or (if available) f.It/Context/Describe.",
+	}
 }
 
 // TagsEqual can be used to check whether two tags are the same.
@@ -472,7 +588,7 @@ func TagsEqual(a, b interface{}) bool {
 	if !ok {
 		return false
 	}
-	if al.extra != bl.extra {
+	if al.extraFeature != bl.extraFeature {
 		return false
 	}
 	return slices.Equal(al.parts, bl.parts)

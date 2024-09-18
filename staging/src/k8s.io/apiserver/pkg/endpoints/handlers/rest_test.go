@@ -27,9 +27,9 @@ import (
 	"testing"
 	"time"
 
-	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/google/go-cmp/cmp"
 	fuzz "github.com/google/gofuzz"
+	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -244,6 +244,10 @@ func TestJSONPatch(t *testing.T) {
 			expectedError:     "the server rejected our request due to an error in our request",
 			expectedErrorType: metav1.StatusReasonInvalid,
 		},
+		{
+			name:  "valid-negative-index-patch",
+			patch: `[{"op": "test", "value": "foo", "path": "/metadata/finalizers/-1"}]`,
+		},
 	} {
 		p := &patcher{
 			patchType:  types.JSONPatchType,
@@ -253,6 +257,7 @@ func TestJSONPatch(t *testing.T) {
 		codec := codecs.LegacyCodec(examplev1.SchemeGroupVersion)
 		pod := &examplev1.Pod{}
 		pod.Name = "podA"
+		pod.ObjectMeta.Finalizers = []string{"foo"}
 		versionedJS, err := runtime.Encode(codec, pod)
 		if err != nil {
 			t.Errorf("%s: unexpected error: %v", test.name, err)

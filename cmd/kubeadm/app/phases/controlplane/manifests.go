@@ -52,8 +52,9 @@ func GetStaticPodSpecs(cfg *kubeadmapi.ClusterConfiguration, endpoint *kubeadmap
 	// Get the required hostpath mounts
 	mounts := getHostPathVolumesForTheControlPlane(cfg)
 	if proxyEnvs == nil {
-		proxyEnvs = kubeadmutil.GetProxyEnvVars()
+		proxyEnvs = kubeadmutil.GetProxyEnvVars(nil)
 	}
+	componentHealthCheckTimeout := kubeadmapi.GetActiveTimeouts().ControlPlaneComponentHealthCheck
 
 	// Prepare static pod specs
 	staticPodSpecs := map[string]v1.Pod{
@@ -65,7 +66,7 @@ func GetStaticPodSpecs(cfg *kubeadmapi.ClusterConfiguration, endpoint *kubeadmap
 			VolumeMounts:    staticpodutil.VolumeMountMapToSlice(mounts.GetVolumeMounts(kubeadmconstants.KubeAPIServer)),
 			LivenessProbe:   staticpodutil.LivenessProbe(staticpodutil.GetAPIServerProbeAddress(endpoint), "/livez", endpoint.BindPort, v1.URISchemeHTTPS),
 			ReadinessProbe:  staticpodutil.ReadinessProbe(staticpodutil.GetAPIServerProbeAddress(endpoint), "/readyz", endpoint.BindPort, v1.URISchemeHTTPS),
-			StartupProbe:    staticpodutil.StartupProbe(staticpodutil.GetAPIServerProbeAddress(endpoint), "/livez", endpoint.BindPort, v1.URISchemeHTTPS, cfg.APIServer.TimeoutForControlPlane),
+			StartupProbe:    staticpodutil.StartupProbe(staticpodutil.GetAPIServerProbeAddress(endpoint), "/livez", endpoint.BindPort, v1.URISchemeHTTPS, componentHealthCheckTimeout),
 			Resources:       staticpodutil.ComponentResources("250m"),
 			Env:             kubeadmutil.MergeKubeadmEnvVars(proxyEnvs, cfg.APIServer.ExtraEnvs),
 		}, mounts.GetVolumes(kubeadmconstants.KubeAPIServer),
@@ -77,7 +78,7 @@ func GetStaticPodSpecs(cfg *kubeadmapi.ClusterConfiguration, endpoint *kubeadmap
 			Command:         getControllerManagerCommand(cfg),
 			VolumeMounts:    staticpodutil.VolumeMountMapToSlice(mounts.GetVolumeMounts(kubeadmconstants.KubeControllerManager)),
 			LivenessProbe:   staticpodutil.LivenessProbe(staticpodutil.GetControllerManagerProbeAddress(cfg), "/healthz", kubeadmconstants.KubeControllerManagerPort, v1.URISchemeHTTPS),
-			StartupProbe:    staticpodutil.StartupProbe(staticpodutil.GetControllerManagerProbeAddress(cfg), "/healthz", kubeadmconstants.KubeControllerManagerPort, v1.URISchemeHTTPS, cfg.APIServer.TimeoutForControlPlane),
+			StartupProbe:    staticpodutil.StartupProbe(staticpodutil.GetControllerManagerProbeAddress(cfg), "/healthz", kubeadmconstants.KubeControllerManagerPort, v1.URISchemeHTTPS, componentHealthCheckTimeout),
 			Resources:       staticpodutil.ComponentResources("200m"),
 			Env:             kubeadmutil.MergeKubeadmEnvVars(proxyEnvs, cfg.ControllerManager.ExtraEnvs),
 		}, mounts.GetVolumes(kubeadmconstants.KubeControllerManager), nil),
@@ -87,8 +88,9 @@ func GetStaticPodSpecs(cfg *kubeadmapi.ClusterConfiguration, endpoint *kubeadmap
 			ImagePullPolicy: v1.PullIfNotPresent,
 			Command:         getSchedulerCommand(cfg),
 			VolumeMounts:    staticpodutil.VolumeMountMapToSlice(mounts.GetVolumeMounts(kubeadmconstants.KubeScheduler)),
-			LivenessProbe:   staticpodutil.LivenessProbe(staticpodutil.GetSchedulerProbeAddress(cfg), "/healthz", kubeadmconstants.KubeSchedulerPort, v1.URISchemeHTTPS),
-			StartupProbe:    staticpodutil.StartupProbe(staticpodutil.GetSchedulerProbeAddress(cfg), "/healthz", kubeadmconstants.KubeSchedulerPort, v1.URISchemeHTTPS, cfg.APIServer.TimeoutForControlPlane),
+			LivenessProbe:   staticpodutil.LivenessProbe(staticpodutil.GetSchedulerProbeAddress(cfg), "/livez", kubeadmconstants.KubeSchedulerPort, v1.URISchemeHTTPS),
+			ReadinessProbe:  staticpodutil.ReadinessProbe(staticpodutil.GetSchedulerProbeAddress(cfg), "/readyz", kubeadmconstants.KubeSchedulerPort, v1.URISchemeHTTPS),
+			StartupProbe:    staticpodutil.StartupProbe(staticpodutil.GetSchedulerProbeAddress(cfg), "/livez", kubeadmconstants.KubeSchedulerPort, v1.URISchemeHTTPS, componentHealthCheckTimeout),
 			Resources:       staticpodutil.ComponentResources("100m"),
 			Env:             kubeadmutil.MergeKubeadmEnvVars(proxyEnvs, cfg.Scheduler.ExtraEnvs),
 		}, mounts.GetVolumes(kubeadmconstants.KubeScheduler), nil),
@@ -178,7 +180,7 @@ func getAPIServerCommand(cfg *kubeadmapi.ClusterConfiguration, localAPIEndpoint 
 		{Name: "secure-port", Value: fmt.Sprintf("%d", localAPIEndpoint.BindPort)},
 		{Name: "allow-privileged", Value: "true"},
 		{Name: "kubelet-preferred-address-types", Value: "InternalIP,ExternalIP,Hostname"},
-		// add options to configure the front proxy.  Without the generated client cert, this will never be useable
+		// add options to configure the front proxy.  Without the generated client cert, this will never be usable
 		// so add it unconditionally with recommended values
 		{Name: "requestheader-username-headers", Value: "X-Remote-User"},
 		{Name: "requestheader-group-headers", Value: "X-Remote-Group"},
@@ -228,7 +230,10 @@ func getAPIServerCommand(cfg *kubeadmapi.ClusterConfiguration, localAPIEndpoint 
 		cfg.APIServer.ExtraArgs = []kubeadmapi.Arg{}
 	}
 	authzVal, _ := kubeadmapi.GetArgValue(cfg.APIServer.ExtraArgs, "authorization-mode", -1)
-	cfg.APIServer.ExtraArgs = kubeadmapi.SetArgValues(cfg.APIServer.ExtraArgs, "authorization-mode", getAuthzModes(authzVal), 1)
+	_, hasStructuredAuthzVal := kubeadmapi.GetArgValue(cfg.APIServer.ExtraArgs, "authorization-config", -1)
+	if hasStructuredAuthzVal == -1 {
+		defaultArguments = kubeadmapi.SetArgValues(defaultArguments, "authorization-mode", getAuthzModes(authzVal), 1)
+	}
 	command = append(command, kubeadmutil.ArgumentsToCommand(defaultArguments, cfg.APIServer.ExtraArgs)...)
 
 	return command

@@ -17,25 +17,24 @@ limitations under the License.
 package upgrade
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/pkg/errors"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	errorsutil "k8s.io/apimachinery/pkg/util/errors"
-	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
 
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	"k8s.io/kubernetes/cmd/kubeadm/app/componentconfigs"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	certsphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/certs"
-	kubeconfigphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/kubeconfig"
 	"k8s.io/kubernetes/cmd/kubeadm/app/preflight"
 	testutil "k8s.io/kubernetes/cmd/kubeadm/test"
 )
@@ -176,6 +175,142 @@ func TestWriteKubeletConfigFiles(t *testing.T) {
 	}
 }
 
+func TestUnupgradedControlPlaneInstances(t *testing.T) {
+	testCases := []struct {
+		name          string
+		pods          []corev1.Pod
+		currentNode   string
+		expectedNodes []string
+		expectError   bool
+	}{
+		{
+			name: "two nodes, one needs upgrade",
+			pods: []corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "kube-apiserver-1",
+						Namespace: metav1.NamespaceSystem,
+						Labels: map[string]string{
+							"component": constants.KubeAPIServer,
+						},
+					},
+					Spec: corev1.PodSpec{
+						NodeName: "node-1",
+						Containers: []corev1.Container{
+							{Name: constants.KubeAPIServer, Image: "registry.kl8s.io/kube-apiserver:v2"},
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "kube-apiserver-2",
+						Namespace: metav1.NamespaceSystem,
+						Labels: map[string]string{
+							"component": constants.KubeAPIServer,
+						},
+					},
+					Spec: corev1.PodSpec{
+						NodeName: "node-2",
+						Containers: []corev1.Container{
+							{Name: constants.KubeAPIServer, Image: "registry.kl8s.io/kube-apiserver:v1"},
+						},
+					},
+				},
+			},
+			currentNode:   "node-1",
+			expectedNodes: []string{"node-2"},
+			expectError:   false,
+		},
+		{
+			name: "one node which is already upgraded",
+			pods: []corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "kube-apiserver-1",
+						Namespace: metav1.NamespaceSystem,
+						Labels: map[string]string{
+							"component": constants.KubeAPIServer,
+						},
+					},
+					Spec: corev1.PodSpec{
+						NodeName: "node-1",
+						Containers: []corev1.Container{
+							{Name: constants.KubeAPIServer, Image: "registry.kl8s.io/kube-apiserver:v2"},
+						},
+					},
+				},
+			},
+			currentNode:   "node-1",
+			expectedNodes: nil,
+			expectError:   false,
+		},
+		{
+			name: "two nodes, both already upgraded",
+			pods: []corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "kube-apiserver-1",
+						Namespace: metav1.NamespaceSystem,
+						Labels: map[string]string{
+							"component": constants.KubeAPIServer,
+						},
+					},
+					Spec: corev1.PodSpec{
+						NodeName: "node-1",
+						Containers: []corev1.Container{
+							{Name: constants.KubeAPIServer, Image: "registry.kl8s.io/kube-apiserver:v2"},
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "kube-apiserver-2",
+						Namespace: metav1.NamespaceSystem,
+						Labels: map[string]string{
+							"component": constants.KubeAPIServer,
+						},
+					},
+					Spec: corev1.PodSpec{
+						NodeName: "node-2",
+						Containers: []corev1.Container{
+							{Name: constants.KubeAPIServer, Image: "registry.kl8s.io/kube-apiserver:v2"},
+						},
+					},
+				},
+			},
+			currentNode:   "node-1",
+			expectedNodes: nil,
+			expectError:   false,
+		},
+		{
+			name:          "no kube-apiserver pods",
+			pods:          []corev1.Pod{},
+			currentNode:   "node-1",
+			expectedNodes: nil,
+			expectError:   true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var runtimeObjs []runtime.Object
+			for _, pod := range tc.pods {
+				runtimeObjs = append(runtimeObjs, &pod) // Use pointer
+			}
+			client := fake.NewSimpleClientset(runtimeObjs...)
+
+			nodes, err := UnupgradedControlPlaneInstances(client, tc.currentNode)
+			if tc.expectError != (err != nil) {
+				t.Fatalf("expected error: %v, got: %v", tc.expectError, err)
+			}
+
+			if !reflect.DeepEqual(nodes, tc.expectedNodes) {
+				t.Fatalf("expected unupgraded control plane instances: %v, got: %v", tc.expectedNodes, nodes)
+			}
+		})
+	}
+}
+
 // Just some stub code, the code could be enriched when necessary.
 type componentConfig struct {
 	userSupplied bool
@@ -236,107 +371,4 @@ func rollbackFiles(files map[string]string, originalErr error) error {
 		}
 	}
 	return errors.Errorf("couldn't move these files: %v. Got errors: %v", files, errorsutil.NewAggregate(errs))
-}
-
-// TODO: Remove this unit test during the 1.30 release cycle:
-// https://github.com/kubernetes/kubeadm/issues/2414
-func TestCreateSuperAdminKubeConfig(t *testing.T) {
-	dir := testutil.SetupTempDir(t)
-	defer os.RemoveAll(dir)
-
-	cfg := testutil.GetDefaultInternalConfig(t)
-	cfg.CertificatesDir = dir
-
-	ca := certsphase.KubeadmCertRootCA()
-	_, _, err := ca.CreateAsCA(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	tests := []struct {
-		name                  string
-		kubeConfigExist       bool
-		expectRBACError       bool
-		expectedError         bool
-		expectKubeConfigError bool
-	}{
-		{
-			name: "no error",
-		},
-		{
-			name:            "no error, kubeconfig files already exist",
-			kubeConfigExist: true,
-		},
-		{
-			name:            "return RBAC error",
-			expectRBACError: true,
-			expectedError:   true,
-		},
-		{
-			name:                  "return kubeconfig error",
-			expectKubeConfigError: true,
-			expectedError:         true,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-
-			// Define a custom RBAC test function, so that there is no test coverage overlap.
-			ensureRBACFunc := func(context.Context, clientset.Interface, clientset.Interface,
-				time.Duration, time.Duration) (clientset.Interface, error) {
-
-				if tc.expectRBACError {
-					return nil, errors.New("ensureRBACFunc error")
-				}
-				return nil, nil
-			}
-
-			// Define a custom kubeconfig function so that we can fail at least one call.
-			kubeConfigFunc := func(a string, b string, cfg *kubeadmapi.InitConfiguration) error {
-				if tc.expectKubeConfigError {
-					return errors.New("kubeConfigFunc error")
-				}
-				return kubeconfigphase.CreateKubeConfigFile(a, b, cfg)
-			}
-
-			// If kubeConfigExist is true, pre-create the admin.conf and super-admin.conf files.
-			if tc.kubeConfigExist {
-				b := []byte("foo")
-				if err := os.WriteFile(filepath.Join(dir, constants.AdminKubeConfigFileName), b, 0644); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(filepath.Join(dir, constants.SuperAdminKubeConfigFileName), b, 0644); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			// Call createSuperAdminKubeConfig() with a custom ensureRBACFunc().
-			err := createSuperAdminKubeConfig(cfg, dir, false, ensureRBACFunc, kubeConfigFunc)
-			if (err != nil) != tc.expectedError {
-				t.Fatalf("expected error: %v, got: %v, error: %v", err != nil, tc.expectedError, err)
-			}
-
-			// Obtain the list of files in the directory after createSuperAdminKubeConfig() is done.
-			var files []string
-			fileInfo, err := os.ReadDir(dir)
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, file := range fileInfo {
-				files = append(files, file.Name())
-			}
-
-			// Verify the expected files.
-			expectedFiles := []string{
-				constants.AdminKubeConfigFileName,
-				constants.CACertName,
-				constants.CAKeyName,
-				constants.SuperAdminKubeConfigFileName,
-			}
-			if !reflect.DeepEqual(expectedFiles, files) {
-				t.Fatalf("expected files: %v, got: %v", expectedFiles, files)
-			}
-		})
-	}
 }

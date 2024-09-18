@@ -37,7 +37,7 @@ import (
 
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmscheme "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/scheme"
-	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
 	"k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/validation"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	phases "k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/join"
@@ -59,7 +59,7 @@ var (
 
 		`)
 
-	joinControPlaneDoneTemp = template.Must(template.New("join").Parse(dedent.Dedent(`
+	joinControlPlaneDoneTemp = template.Must(template.New("join").Parse(dedent.Dedent(`
 		This node has joined the cluster and a new control plane instance was created:
 
 		* Certificate signing request was sent to apiserver and approval was received.
@@ -175,7 +175,10 @@ func newCmdJoin(out io.Writer, joinOptions *joinOptions) *cobra.Command {
 				return err
 			}
 
-			data := c.(*joinData)
+			data, ok := c.(*joinData)
+			if !ok {
+				return errors.New("invalid data struct")
+			}
 
 			if err := joinRunner.Run(args); err != nil {
 				return err
@@ -193,7 +196,7 @@ func newCmdJoin(out io.Writer, joinOptions *joinOptions) *cobra.Command {
 					"KubeConfigPath": kubeadmconstants.GetAdminKubeConfigPath(),
 					"etcdMessage":    etcdMessage,
 				}
-				if err := joinControPlaneDoneTemp.Execute(data.outputWriter, ctx); err != nil {
+				if err := joinControlPlaneDoneTemp.Execute(data.outputWriter, ctx); err != nil {
 					return err
 				}
 
@@ -216,7 +219,10 @@ func newCmdJoin(out io.Writer, joinOptions *joinOptions) *cobra.Command {
 	joinRunner.AppendPhase(phases.NewControlPlanePreparePhase())
 	joinRunner.AppendPhase(phases.NewCheckEtcdPhase())
 	joinRunner.AppendPhase(phases.NewKubeletStartPhase())
+	joinRunner.AppendPhase(phases.NewEtcdJoinPhase())
+	joinRunner.AppendPhase(phases.NewKubeletWaitBootstrapPhase())
 	joinRunner.AppendPhase(phases.NewControlPlaneJoinPhase())
+	joinRunner.AppendPhase(phases.NewWaitControlPlanePhase())
 
 	// sets the data builder function, that will be used by the runner
 	// both when running the entire workflow or single phases

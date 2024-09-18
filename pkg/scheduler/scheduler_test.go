@@ -18,15 +18,18 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/onsi/gomega"
 	v1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	eventsv1 "k8s.io/api/events/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -40,21 +43,23 @@ import (
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/klog/v2"
 	"k8s.io/klog/v2/ktesting"
+	testingclock "k8s.io/utils/clock/testing"
+	"k8s.io/utils/ptr"
+
 	"k8s.io/kubernetes/pkg/features"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config/testing/defaults"
+	internalcache "k8s.io/kubernetes/pkg/scheduler/backend/cache"
+	internalqueue "k8s.io/kubernetes/pkg/scheduler/backend/queue"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/defaultbinder"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/queuesort"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
-	internalcache "k8s.io/kubernetes/pkg/scheduler/internal/cache"
-	internalqueue "k8s.io/kubernetes/pkg/scheduler/internal/queue"
 	"k8s.io/kubernetes/pkg/scheduler/profile"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	tf "k8s.io/kubernetes/pkg/scheduler/testing/framework"
-	testingclock "k8s.io/utils/clock/testing"
-	"k8s.io/utils/ptr"
+	utiltesting "k8s.io/kubernetes/test/utils/ktesting"
 )
 
 func TestSchedulerCreation(t *testing.T) {
@@ -176,7 +181,7 @@ func TestSchedulerCreation(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			client := fake.NewSimpleClientset()
+			client := fake.NewClientset()
 			informerFactory := informers.NewSharedInformerFactory(client, 0)
 
 			eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1()})
@@ -273,7 +278,7 @@ func TestFailureHandler(t *testing.T) {
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
 
-			client := fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testPod}})
+			client := fake.NewClientset(&v1.PodList{Items: []v1.Pod{*testPod}})
 			informerFactory := informers.NewSharedInformerFactory(client, 0)
 			podInformer := informerFactory.Core().V1().Pods()
 			// Need to add/update/delete testPod to the store.
@@ -282,9 +287,7 @@ func TestFailureHandler(t *testing.T) {
 			queue := internalqueue.NewPriorityQueue(nil, informerFactory, internalqueue.WithClock(testingclock.NewFakeClock(time.Now())))
 			schedulerCache := internalcache.New(ctx, 30*time.Second)
 
-			if err := queue.Add(logger, testPod); err != nil {
-				t.Fatalf("Add failed: %v", err)
-			}
+			queue.Add(logger, testPod)
 
 			if _, err := queue.Pop(logger); err != nil {
 				t.Fatalf("Pop failed: %v", err)
@@ -325,76 +328,6 @@ func TestFailureHandler(t *testing.T) {
 	}
 }
 
-func TestFailureHandler_NodeNotFound(t *testing.T) {
-	nodeFoo := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "foo"}}
-	nodeBar := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "bar"}}
-	testPod := st.MakePod().Name("test-pod").Namespace(v1.NamespaceDefault).Obj()
-	tests := []struct {
-		name             string
-		nodes            []v1.Node
-		nodeNameToDelete string
-		injectErr        error
-		expectNodeNames  sets.Set[string]
-	}{
-		{
-			name:             "node is deleted during a scheduling cycle",
-			nodes:            []v1.Node{*nodeFoo, *nodeBar},
-			nodeNameToDelete: "foo",
-			injectErr:        apierrors.NewNotFound(v1.Resource("node"), nodeFoo.Name),
-			expectNodeNames:  sets.New("bar"),
-		},
-		{
-			name:            "node is not deleted but NodeNotFound is received incorrectly",
-			nodes:           []v1.Node{*nodeFoo, *nodeBar},
-			injectErr:       apierrors.NewNotFound(v1.Resource("node"), nodeFoo.Name),
-			expectNodeNames: sets.New("foo", "bar"),
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			logger, ctx := ktesting.NewTestContext(t)
-			ctx, cancel := context.WithCancel(ctx)
-			defer cancel()
-
-			client := fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testPod}}, &v1.NodeList{Items: tt.nodes})
-			informerFactory := informers.NewSharedInformerFactory(client, 0)
-			podInformer := informerFactory.Core().V1().Pods()
-			// Need to add testPod to the store.
-			podInformer.Informer().GetStore().Add(testPod)
-
-			queue := internalqueue.NewPriorityQueue(nil, informerFactory, internalqueue.WithClock(testingclock.NewFakeClock(time.Now())))
-			schedulerCache := internalcache.New(ctx, 30*time.Second)
-
-			for i := range tt.nodes {
-				node := tt.nodes[i]
-				// Add node to schedulerCache no matter it's deleted in API server or not.
-				schedulerCache.AddNode(logger, &node)
-				if node.Name == tt.nodeNameToDelete {
-					client.CoreV1().Nodes().Delete(ctx, node.Name, metav1.DeleteOptions{})
-				}
-			}
-
-			s, fwk, err := initScheduler(ctx, schedulerCache, queue, client, informerFactory)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			testPodInfo := &framework.QueuedPodInfo{PodInfo: mustNewPodInfo(t, testPod)}
-			s.FailureHandler(ctx, fwk, testPodInfo, framework.NewStatus(framework.Unschedulable).WithError(tt.injectErr), nil, time.Now())
-
-			gotNodes := schedulerCache.Dump().Nodes
-			gotNodeNames := sets.New[string]()
-			for _, nodeInfo := range gotNodes {
-				gotNodeNames.Insert(nodeInfo.Node().Name)
-			}
-			if diff := cmp.Diff(tt.expectNodeNames, gotNodeNames); diff != "" {
-				t.Errorf("Unexpected nodes (-want, +got): %s", diff)
-			}
-		})
-	}
-}
-
 func TestFailureHandler_PodAlreadyBound(t *testing.T) {
 	logger, ctx := ktesting.NewTestContext(t)
 	ctx, cancel := context.WithCancel(ctx)
@@ -403,7 +336,7 @@ func TestFailureHandler_PodAlreadyBound(t *testing.T) {
 	nodeFoo := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "foo"}}
 	testPod := st.MakePod().Name("test-pod").Namespace(v1.NamespaceDefault).Node("foo").Obj()
 
-	client := fake.NewSimpleClientset(&v1.PodList{Items: []v1.Pod{*testPod}}, &v1.NodeList{Items: []v1.Node{nodeFoo}})
+	client := fake.NewClientset(&v1.PodList{Items: []v1.Pod{*testPod}}, &v1.NodeList{Items: []v1.Node{nodeFoo}})
 	informerFactory := informers.NewSharedInformerFactory(client, 0)
 	podInformer := informerFactory.Core().V1().Pods()
 	// Need to add testPod to the store.
@@ -450,7 +383,7 @@ func TestWithPercentageOfNodesToScore(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client := fake.NewSimpleClientset()
+			client := fake.NewClientset()
 			informerFactory := informers.NewSharedInformerFactory(client, 0)
 			eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1()})
 			_, ctx := ktesting.NewTestContext(t)
@@ -509,12 +442,14 @@ func initScheduler(ctx context.Context, cache internalcache.Cache, queue interna
 		tf.RegisterBindPlugin(defaultbinder.Name, defaultbinder.New),
 	}
 	eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1()})
+	waitingPods := frameworkruntime.NewWaitingPodsMap()
 	fwk, err := tf.NewFramework(ctx,
 		registerPluginFuncs,
 		testSchedulerName,
 		frameworkruntime.WithClientSet(client),
 		frameworkruntime.WithInformerFactory(informerFactory),
 		frameworkruntime.WithEventRecorder(eventBroadcaster.NewRecorder(scheme.Scheme, testSchedulerName)),
+		frameworkruntime.WithWaitingPods(waitingPods),
 	)
 	if err != nil {
 		return nil, nil, err
@@ -660,8 +595,11 @@ const (
 	fakeNode                       = "fakeNode"
 	fakePod                        = "fakePod"
 	emptyEventsToRegister          = "emptyEventsToRegister"
+	errorEventsToRegister          = "errorEventsToRegister"
 	queueSort                      = "no-op-queue-sort-plugin"
 	fakeBind                       = "bind-plugin"
+	emptyEventExtensions           = "emptyEventExtensions"
+	fakePermit                     = "fakePermit"
 )
 
 func Test_buildQueueingHintMap(t *testing.T) {
@@ -670,6 +608,7 @@ func Test_buildQueueingHintMap(t *testing.T) {
 		plugins             []framework.Plugin
 		want                map[framework.ClusterEvent][]*internalqueue.QueueingHintFunction
 		featuregateDisabled bool
+		wantErr             error
 	}{
 		{
 			name:    "filter without EnqueueExtensions plugin",
@@ -702,6 +641,12 @@ func Test_buildQueueingHintMap(t *testing.T) {
 				{Resource: framework.PodSchedulingContext, ActionType: framework.All}: {
 					{PluginName: filterWithoutEnqueueExtensions, QueueingHintFn: defaultQueueingHintFn},
 				},
+				{Resource: framework.ResourceClaim, ActionType: framework.All}: {
+					{PluginName: filterWithoutEnqueueExtensions, QueueingHintFn: defaultQueueingHintFn},
+				},
+				{Resource: framework.DeviceClass, ActionType: framework.All}: {
+					{PluginName: filterWithoutEnqueueExtensions, QueueingHintFn: defaultQueueingHintFn},
+				},
 			},
 		},
 		{
@@ -713,6 +658,9 @@ func Test_buildQueueingHintMap(t *testing.T) {
 				},
 				{Resource: framework.Node, ActionType: framework.Add}: {
 					{PluginName: fakeNode, QueueingHintFn: fakeNodePluginQueueingFn},
+				},
+				{Resource: framework.Node, ActionType: framework.UpdateNodeTaint}: {
+					{PluginName: fakeNode, QueueingHintFn: defaultQueueingHintFn}, // When Node/Add is registered, Node/UpdateNodeTaint is automatically registered.
 				},
 			},
 		},
@@ -727,13 +675,42 @@ func Test_buildQueueingHintMap(t *testing.T) {
 				{Resource: framework.Node, ActionType: framework.Add}: {
 					{PluginName: fakeNode, QueueingHintFn: defaultQueueingHintFn}, // default queueing hint due to disabled feature gate.
 				},
+				{Resource: framework.Node, ActionType: framework.UpdateNodeTaint}: {
+					{PluginName: fakeNode, QueueingHintFn: defaultQueueingHintFn}, // When Node/Add is registered, Node/UpdateNodeTaint is automatically registered.
+				},
 			},
+		},
+		{
+			name:    "register plugin with empty event",
+			plugins: []framework.Plugin{&emptyEventPlugin{}},
+			want:    map[framework.ClusterEvent][]*internalqueue.QueueingHintFunction{},
+		},
+		{
+			name:    "register plugins including emptyEventPlugin",
+			plugins: []framework.Plugin{&emptyEventPlugin{}, &fakeNodePlugin{}},
+			want: map[framework.ClusterEvent][]*internalqueue.QueueingHintFunction{
+				{Resource: framework.Pod, ActionType: framework.Add}: {
+					{PluginName: fakePod, QueueingHintFn: fakePodPluginQueueingFn},
+				},
+				{Resource: framework.Node, ActionType: framework.Add}: {
+					{PluginName: fakeNode, QueueingHintFn: fakeNodePluginQueueingFn},
+				},
+				{Resource: framework.Node, ActionType: framework.UpdateNodeTaint}: {
+					{PluginName: fakeNode, QueueingHintFn: defaultQueueingHintFn}, // When Node/Add is registered, Node/UpdateNodeTaint is automatically registered.
+				},
+			},
+		},
+		{
+			name:    "one EventsToRegister returns an error",
+			plugins: []framework.Plugin{&errorEventsToRegisterPlugin{}},
+			want:    map[framework.ClusterEvent][]*internalqueue.QueueingHintFunction{},
+			wantErr: errors.New("mock error"),
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SchedulerQueueingHints, !tt.featuregateDisabled)()
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SchedulerQueueingHints, !tt.featuregateDisabled)
 			logger, ctx := ktesting.NewTestContext(t)
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
@@ -762,7 +739,16 @@ func Test_buildQueueingHintMap(t *testing.T) {
 				return exts[i].Name() < exts[j].Name()
 			})
 
-			got := buildQueueingHintMap(exts)
+			got, err := buildQueueingHintMap(ctx, exts)
+			if err != nil {
+				if tt.wantErr != nil && tt.wantErr.Error() != err.Error() {
+					t.Fatalf("unexpected error from buildQueueingHintMap: expected: %v, actual: %v", tt.wantErr, err)
+				}
+
+				if tt.wantErr == nil {
+					t.Fatalf("unexpected error from buildQueueingHintMap: %v", err)
+				}
+			}
 
 			for e, fns := range got {
 				wantfns, ok := tt.want[e]
@@ -794,9 +780,11 @@ func Test_buildQueueingHintMap(t *testing.T) {
 // Test_UnionedGVKs tests UnionedGVKs worked with buildQueueingHintMap.
 func Test_UnionedGVKs(t *testing.T) {
 	tests := []struct {
-		name    string
-		plugins schedulerapi.PluginSet
-		want    map[framework.GVK]framework.ActionType
+		name                            string
+		plugins                         schedulerapi.PluginSet
+		want                            map[framework.GVK]framework.ActionType
+		enableInPlacePodVerticalScaling bool
+		enableSchedulerQueueingHints    bool
 	}{
 		{
 			name: "filter without EnqueueExtensions plugin",
@@ -818,6 +806,8 @@ func Test_UnionedGVKs(t *testing.T) {
 				framework.PersistentVolumeClaim: framework.All,
 				framework.StorageClass:          framework.All,
 				framework.PodSchedulingContext:  framework.All,
+				framework.ResourceClaim:         framework.All,
+				framework.DeviceClass:           framework.All,
 			},
 		},
 		{
@@ -831,7 +821,7 @@ func Test_UnionedGVKs(t *testing.T) {
 				Disabled: []schedulerapi.Plugin{{Name: "*"}}, // disable default plugins
 			},
 			want: map[framework.GVK]framework.ActionType{
-				framework.Node: framework.Add,
+				framework.Node: framework.Add | framework.UpdateNodeTaint, // When Node/Add is registered, Node/UpdateNodeTaint is automatically registered.
 			},
 		},
 		{
@@ -861,7 +851,7 @@ func Test_UnionedGVKs(t *testing.T) {
 			},
 			want: map[framework.GVK]framework.ActionType{
 				framework.Pod:  framework.Add,
-				framework.Node: framework.Add,
+				framework.Node: framework.Add | framework.UpdateNodeTaint, // When Node/Add is registered, Node/UpdateNodeTaint is automatically registered.
 			},
 		},
 		{
@@ -877,11 +867,11 @@ func Test_UnionedGVKs(t *testing.T) {
 			want: map[framework.GVK]framework.ActionType{},
 		},
 		{
-			name:    "plugins with default profile",
+			name:    "plugins with default profile (No feature gate enabled)",
 			plugins: schedulerapi.PluginSet{Enabled: defaults.PluginsV1.MultiPoint.Enabled},
 			want: map[framework.GVK]framework.ActionType{
-				framework.Pod:                   framework.All,
-				framework.Node:                  framework.All,
+				framework.Pod:                   framework.Add | framework.UpdatePodLabel | framework.Delete,
+				framework.Node:                  framework.Add | framework.UpdateNodeAllocatable | framework.UpdateNodeLabel | framework.UpdateNodeTaint | framework.Delete,
 				framework.CSINode:               framework.All - framework.Delete,
 				framework.CSIDriver:             framework.All - framework.Delete,
 				framework.CSIStorageCapacity:    framework.All - framework.Delete,
@@ -890,9 +880,43 @@ func Test_UnionedGVKs(t *testing.T) {
 				framework.StorageClass:          framework.All - framework.Delete,
 			},
 		},
+		{
+			name:    "plugins with default profile (InPlacePodVerticalScaling: enabled)",
+			plugins: schedulerapi.PluginSet{Enabled: defaults.PluginsV1.MultiPoint.Enabled},
+			want: map[framework.GVK]framework.ActionType{
+				framework.Pod:                   framework.Add | framework.UpdatePodLabel | framework.UpdatePodScaleDown | framework.Delete,
+				framework.Node:                  framework.Add | framework.UpdateNodeAllocatable | framework.UpdateNodeLabel | framework.UpdateNodeTaint | framework.Delete,
+				framework.CSINode:               framework.All - framework.Delete,
+				framework.CSIDriver:             framework.All - framework.Delete,
+				framework.CSIStorageCapacity:    framework.All - framework.Delete,
+				framework.PersistentVolume:      framework.All - framework.Delete,
+				framework.PersistentVolumeClaim: framework.All - framework.Delete,
+				framework.StorageClass:          framework.All - framework.Delete,
+			},
+			enableInPlacePodVerticalScaling: true,
+		},
+		{
+			name:    "plugins with default profile (queueingHint/InPlacePodVerticalScaling: enabled)",
+			plugins: schedulerapi.PluginSet{Enabled: defaults.PluginsV1.MultiPoint.Enabled},
+			want: map[framework.GVK]framework.ActionType{
+				framework.Pod:                   framework.Add | framework.UpdatePodLabel | framework.UpdatePodScaleDown | framework.UpdatePodTolerations | framework.UpdatePodSchedulingGatesEliminated | framework.Delete,
+				framework.Node:                  framework.Add | framework.UpdateNodeAllocatable | framework.UpdateNodeLabel | framework.UpdateNodeTaint | framework.Delete,
+				framework.CSINode:               framework.All - framework.Delete,
+				framework.CSIDriver:             framework.All - framework.Delete,
+				framework.CSIStorageCapacity:    framework.All - framework.Delete,
+				framework.PersistentVolume:      framework.All - framework.Delete,
+				framework.PersistentVolumeClaim: framework.All - framework.Delete,
+				framework.StorageClass:          framework.All - framework.Delete,
+			},
+			enableInPlacePodVerticalScaling: true,
+			enableSchedulerQueueingHints:    true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, tt.enableInPlacePodVerticalScaling)
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SchedulerQueueingHints, tt.enableSchedulerQueueingHints)
+
 			_, ctx := ktesting.NewTestContext(t)
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
@@ -914,9 +938,12 @@ func Test_UnionedGVKs(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-
+			queueingHintMap, err := buildQueueingHintMap(ctx, fwk.EnqueueExtensions())
+			if err != nil {
+				t.Fatal(err)
+			}
 			queueingHintsPerProfile := internalqueue.QueueingHintMapPerProfile{
-				"default": buildQueueingHintMap(fwk.EnqueueExtensions()),
+				"default": queueingHintMap,
 			}
 			got := unionedGVKs(queueingHintsPerProfile)
 
@@ -930,8 +957,160 @@ func Test_UnionedGVKs(t *testing.T) {
 func newFramework(ctx context.Context, r frameworkruntime.Registry, profile schedulerapi.KubeSchedulerProfile) (framework.Framework, error) {
 	return frameworkruntime.NewFramework(ctx, r, &profile,
 		frameworkruntime.WithSnapshotSharedLister(internalcache.NewSnapshot(nil, nil)),
-		frameworkruntime.WithInformerFactory(informers.NewSharedInformerFactory(fake.NewSimpleClientset(), 0)),
+		frameworkruntime.WithInformerFactory(informers.NewSharedInformerFactory(fake.NewClientset(), 0)),
 	)
+}
+
+func TestFrameworkHandler_IterateOverWaitingPods(t *testing.T) {
+	const (
+		testSchedulerProfile1 = "test-scheduler-profile-1"
+		testSchedulerProfile2 = "test-scheduler-profile-2"
+		testSchedulerProfile3 = "test-scheduler-profile-3"
+	)
+
+	nodes := []runtime.Object{
+		st.MakeNode().Name("node1").UID("node1").Obj(),
+		st.MakeNode().Name("node2").UID("node2").Obj(),
+		st.MakeNode().Name("node3").UID("node3").Obj(),
+	}
+
+	cases := []struct {
+		name                        string
+		profiles                    []schedulerapi.KubeSchedulerProfile
+		waitSchedulingPods          []*v1.Pod
+		expectPodNamesInWaitingPods []string
+	}{
+		{
+			name: "pods with same profile are waiting on permit stage",
+			profiles: []schedulerapi.KubeSchedulerProfile{
+				{
+					SchedulerName: testSchedulerProfile1,
+					Plugins: &schedulerapi.Plugins{
+						QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+						Permit:    schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: fakePermit}}},
+						Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+					},
+				},
+			},
+			waitSchedulingPods: []*v1.Pod{
+				st.MakePod().Name("pod1").UID("pod1").SchedulerName(testSchedulerProfile1).Obj(),
+				st.MakePod().Name("pod2").UID("pod2").SchedulerName(testSchedulerProfile1).Obj(),
+				st.MakePod().Name("pod3").UID("pod3").SchedulerName(testSchedulerProfile1).Obj(),
+			},
+			expectPodNamesInWaitingPods: []string{"pod1", "pod2", "pod3"},
+		},
+		{
+			name: "pods with different profiles are waiting on permit stage",
+			profiles: []schedulerapi.KubeSchedulerProfile{
+				{
+					SchedulerName: testSchedulerProfile1,
+					Plugins: &schedulerapi.Plugins{
+						QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+						Permit:    schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: fakePermit}}},
+						Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+					},
+				},
+				{
+					SchedulerName: testSchedulerProfile2,
+					Plugins: &schedulerapi.Plugins{
+						QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+						Permit:    schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: fakePermit}}},
+						Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+					},
+				},
+				{
+					SchedulerName: testSchedulerProfile3,
+					Plugins: &schedulerapi.Plugins{
+						QueueSort: schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "PrioritySort"}}},
+						Permit:    schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: fakePermit}}},
+						Bind:      schedulerapi.PluginSet{Enabled: []schedulerapi.Plugin{{Name: "DefaultBinder"}}},
+					},
+				},
+			},
+			waitSchedulingPods: []*v1.Pod{
+				st.MakePod().Name("pod1").UID("pod1").SchedulerName(testSchedulerProfile1).Obj(),
+				st.MakePod().Name("pod2").UID("pod2").SchedulerName(testSchedulerProfile1).Obj(),
+				st.MakePod().Name("pod3").UID("pod3").SchedulerName(testSchedulerProfile2).Obj(),
+				st.MakePod().Name("pod4").UID("pod4").SchedulerName(testSchedulerProfile3).Obj(),
+			},
+			expectPodNamesInWaitingPods: []string{"pod1", "pod2", "pod3", "pod4"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Set up scheduler for the 3 nodes.
+			objs := append([]runtime.Object{&v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ""}}}, nodes...)
+			fakeClient := fake.NewClientset(objs...)
+			informerFactory := informers.NewSharedInformerFactory(fakeClient, 0)
+			eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: fakeClient.EventsV1()})
+			defer eventBroadcaster.Shutdown()
+
+			eventRecorder := eventBroadcaster.NewRecorder(scheme.Scheme, fakePermit)
+
+			outOfTreeRegistry := frameworkruntime.Registry{
+				fakePermit: newFakePermitPlugin(eventRecorder),
+			}
+
+			tCtx := utiltesting.Init(t)
+
+			scheduler, err := New(
+				tCtx,
+				fakeClient,
+				informerFactory,
+				nil,
+				profile.NewRecorderFactory(eventBroadcaster),
+				WithProfiles(tc.profiles...),
+				WithFrameworkOutOfTreeRegistry(outOfTreeRegistry),
+			)
+
+			if err != nil {
+				t.Fatalf("Failed to create scheduler: %v", err)
+			}
+
+			var wg sync.WaitGroup
+			waitSchedulingPodNumber := len(tc.waitSchedulingPods)
+			wg.Add(waitSchedulingPodNumber)
+			stopFn, err := eventBroadcaster.StartEventWatcher(func(obj runtime.Object) {
+				e, ok := obj.(*eventsv1.Event)
+				if !ok || (e.Reason != podWaitingReason) {
+					return
+				}
+				wg.Done()
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stopFn()
+
+			// Run scheduler.
+			informerFactory.Start(tCtx.Done())
+			informerFactory.WaitForCacheSync(tCtx.Done())
+			go scheduler.Run(tCtx)
+
+			// Send pods to be scheduled.
+			for _, p := range tc.waitSchedulingPods {
+				_, err = fakeClient.CoreV1().Pods("").Create(tCtx, p, metav1.CreateOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// Wait all pods in waitSchedulingPods to be scheduled.
+			wg.Wait()
+
+			utiltesting.Eventually(tCtx, func(utiltesting.TContext) sets.Set[string] {
+				// Ensure that all waitingPods in scheduler can be obtained from any profiles.
+				actualPodNamesInWaitingPods := sets.New[string]()
+				for _, fwk := range scheduler.Profiles {
+					fwk.IterateOverWaitingPods(func(pod framework.WaitingPod) {
+						actualPodNamesInWaitingPods.Insert(pod.GetPod().Name)
+					})
+				}
+				return actualPodNamesInWaitingPods
+			}).WithTimeout(permitTimeout).Should(gomega.Equal(sets.New(tc.expectPodNamesInWaitingPods...)), "unexpected waitingPods in scheduler profile")
+		})
+	}
 }
 
 var _ framework.QueueSortPlugin = &fakeQueueSortPlugin{}
@@ -983,10 +1162,10 @@ func (*fakeNodePlugin) Filter(_ context.Context, _ *framework.CycleState, _ *v1.
 	return nil
 }
 
-func (pl *fakeNodePlugin) EventsToRegister() []framework.ClusterEventWithHint {
+func (pl *fakeNodePlugin) EventsToRegister(_ context.Context) ([]framework.ClusterEventWithHint, error) {
 	return []framework.ClusterEventWithHint{
 		{Event: framework.ClusterEvent{Resource: framework.Node, ActionType: framework.Add}, QueueingHintFn: fakeNodePluginQueueingFn},
-	}
+	}, nil
 }
 
 var hintFromFakePod = framework.QueueingHint(101)
@@ -1003,10 +1182,35 @@ func (*fakePodPlugin) Filter(_ context.Context, _ *framework.CycleState, _ *v1.P
 	return nil
 }
 
-func (pl *fakePodPlugin) EventsToRegister() []framework.ClusterEventWithHint {
+func (pl *fakePodPlugin) EventsToRegister(_ context.Context) ([]framework.ClusterEventWithHint, error) {
 	return []framework.ClusterEventWithHint{
 		{Event: framework.ClusterEvent{Resource: framework.Pod, ActionType: framework.Add}, QueueingHintFn: fakePodPluginQueueingFn},
-	}
+	}, nil
+}
+
+type emptyEventPlugin struct{}
+
+func (*emptyEventPlugin) Name() string { return emptyEventExtensions }
+
+func (*emptyEventPlugin) Filter(_ context.Context, _ *framework.CycleState, _ *v1.Pod, _ *framework.NodeInfo) *framework.Status {
+	return nil
+}
+
+func (pl *emptyEventPlugin) EventsToRegister(_ context.Context) ([]framework.ClusterEventWithHint, error) {
+	return nil, nil
+}
+
+// errorEventsToRegisterPlugin is a mock plugin that returns an error for EventsToRegister method
+type errorEventsToRegisterPlugin struct{}
+
+func (*errorEventsToRegisterPlugin) Name() string { return errorEventsToRegister }
+
+func (*errorEventsToRegisterPlugin) Filter(_ context.Context, _ *framework.CycleState, _ *v1.Pod, _ *framework.NodeInfo) *framework.Status {
+	return nil
+}
+
+func (*errorEventsToRegisterPlugin) EventsToRegister(_ context.Context) ([]framework.ClusterEventWithHint, error) {
+	return nil, errors.New("mock error")
 }
 
 // emptyEventsToRegisterPlugin implement interface framework.EnqueueExtensions, but returns nil from EventsToRegister.
@@ -1020,4 +1224,40 @@ func (*emptyEventsToRegisterPlugin) Filter(_ context.Context, _ *framework.Cycle
 	return nil
 }
 
-func (*emptyEventsToRegisterPlugin) EventsToRegister() []framework.ClusterEventWithHint { return nil }
+func (*emptyEventsToRegisterPlugin) EventsToRegister(_ context.Context) ([]framework.ClusterEventWithHint, error) {
+	return nil, nil
+}
+
+// fakePermitPlugin only implements PermitPlugin interface.
+type fakePermitPlugin struct {
+	eventRecorder events.EventRecorder
+}
+
+func newFakePermitPlugin(eventRecorder events.EventRecorder) frameworkruntime.PluginFactory {
+	return func(ctx context.Context, configuration runtime.Object, f framework.Handle) (framework.Plugin, error) {
+		pl := &fakePermitPlugin{
+			eventRecorder: eventRecorder,
+		}
+		return pl, nil
+	}
+}
+
+func (f fakePermitPlugin) Name() string {
+	return fakePermit
+}
+
+const (
+	podWaitingReason = "podWaiting"
+	permitTimeout    = 10 * time.Second
+)
+
+func (f fakePermitPlugin) Permit(ctx context.Context, state *framework.CycleState, p *v1.Pod, nodeName string) (*framework.Status, time.Duration) {
+	defer func() {
+		// Send event with podWaiting reason to broadcast this pod is already waiting in the permit stage.
+		f.eventRecorder.Eventf(p, nil, v1.EventTypeWarning, podWaitingReason, "", "")
+	}()
+
+	return framework.NewStatus(framework.Wait), permitTimeout
+}
+
+var _ framework.PermitPlugin = &fakePermitPlugin{}

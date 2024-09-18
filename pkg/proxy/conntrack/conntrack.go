@@ -1,3 +1,6 @@
+//go:build linux
+// +build linux
+
 /*
 Copyright 2016 The Kubernetes Authors.
 
@@ -18,105 +21,51 @@ package conntrack
 
 import (
 	"fmt"
-	"strconv"
-	"strings"
 
-	v1 "k8s.io/api/core/v1"
+	"github.com/vishvananda/netlink"
+
 	"k8s.io/klog/v2"
-	"k8s.io/utils/exec"
-	utilnet "k8s.io/utils/net"
 )
 
-// Utilities for dealing with conntrack
-
-// NoConnectionToDelete is the error string returned by conntrack when no matching connections are found
-const NoConnectionToDelete = "0 flow entries have been deleted"
-
-func protoStr(proto v1.Protocol) string {
-	return strings.ToLower(string(proto))
+// Interface for dealing with conntrack
+type Interface interface {
+	// ClearEntries deletes conntrack entries for connections of the given IP family,
+	// filtered by the given filters.
+	ClearEntries(ipFamily uint8, filters ...netlink.CustomConntrackFilter) error
 }
 
-func parametersWithFamily(isIPv6 bool, parameters ...string) []string {
-	if isIPv6 {
-		parameters = append(parameters, "-f", "ipv6")
+// netlinkHandler allows consuming real and mockable implementation for testing.
+type netlinkHandler interface {
+	ConntrackDeleteFilters(netlink.ConntrackTableType, netlink.InetFamily, ...netlink.CustomConntrackFilter) (uint, error)
+}
+
+// conntracker implements Interface by using netlink APIs.
+type conntracker struct {
+	handler netlinkHandler
+}
+
+var _ Interface = &conntracker{}
+
+func New() Interface {
+	return newConntracker(&netlink.Handle{})
+}
+
+func newConntracker(handler netlinkHandler) Interface {
+	return &conntracker{handler: handler}
+}
+
+// ClearEntries deletes conntrack entries for connections of the given IP family,
+// filtered by the given filters.
+func (ct *conntracker) ClearEntries(ipFamily uint8, filters ...netlink.CustomConntrackFilter) error {
+	if len(filters) == 0 {
+		klog.V(7).InfoS("no conntrack filters provided")
+		return nil
 	}
-	return parameters
-}
 
-// ClearEntriesForIP uses the conntrack tool to delete the conntrack entries
-// for the UDP connections specified by the given service IP
-func ClearEntriesForIP(execer exec.Interface, ip string, protocol v1.Protocol) error {
-	parameters := parametersWithFamily(utilnet.IsIPv6String(ip), "-D", "--orig-dst", ip, "-p", protoStr(protocol))
-	err := Exec(execer, parameters...)
-	if err != nil && !strings.Contains(err.Error(), NoConnectionToDelete) {
-		// TODO: Better handling for deletion failure. When failure occur, stale udp connection may not get flushed.
-		// These stale udp connection will keep black hole traffic. Making this a best effort operation for now, since it
-		// is expensive to baby-sit all udp connections to kubernetes services.
-		return fmt.Errorf("error deleting connection tracking state for UDP service IP: %s, error: %v", ip, err)
-	}
-	return nil
-}
-
-// Exec executes the conntrack tool using the given parameters
-func Exec(execer exec.Interface, parameters ...string) error {
-	conntrackPath, err := execer.LookPath("conntrack")
+	n, err := ct.handler.ConntrackDeleteFilters(netlink.ConntrackTable, netlink.InetFamily(ipFamily), filters...)
 	if err != nil {
-		return fmt.Errorf("error looking for path of conntrack: %v", err)
+		return fmt.Errorf("error deleting conntrack entries, error: %w", err)
 	}
-	klog.V(4).InfoS("Clearing conntrack entries", "parameters", parameters)
-	output, err := execer.Command(conntrackPath, parameters...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("conntrack command returned: %q, error message: %s", string(output), err)
-	}
-	klog.V(4).InfoS("Conntrack entries deleted", "output", string(output))
-	return nil
-}
-
-// ClearEntriesForPort uses the conntrack tool to delete the conntrack entries
-// for connections specified by the port.
-// When a packet arrives, it will not go through NAT table again, because it is not "the first" packet.
-// The solution is clearing the conntrack. Known issues:
-// https://github.com/docker/docker/issues/8795
-// https://github.com/kubernetes/kubernetes/issues/31983
-func ClearEntriesForPort(execer exec.Interface, port int, isIPv6 bool, protocol v1.Protocol) error {
-	if port <= 0 {
-		return fmt.Errorf("wrong port number. The port number must be greater than zero")
-	}
-	parameters := parametersWithFamily(isIPv6, "-D", "-p", protoStr(protocol), "--dport", strconv.Itoa(port))
-	err := Exec(execer, parameters...)
-	if err != nil && !strings.Contains(err.Error(), NoConnectionToDelete) {
-		return fmt.Errorf("error deleting conntrack entries for UDP port: %d, error: %v", port, err)
-	}
-	return nil
-}
-
-// ClearEntriesForNAT uses the conntrack tool to delete the conntrack entries
-// for connections specified by the {origin, dest} IP pair.
-func ClearEntriesForNAT(execer exec.Interface, origin, dest string, protocol v1.Protocol) error {
-	parameters := parametersWithFamily(utilnet.IsIPv6String(origin), "-D", "--orig-dst", origin, "--dst-nat", dest,
-		"-p", protoStr(protocol))
-	err := Exec(execer, parameters...)
-	if err != nil && !strings.Contains(err.Error(), NoConnectionToDelete) {
-		// TODO: Better handling for deletion failure. When failure occur, stale udp connection may not get flushed.
-		// These stale udp connection will keep black hole traffic. Making this a best effort operation for now, since it
-		// is expensive to baby sit all udp connections to kubernetes services.
-		return fmt.Errorf("error deleting conntrack entries for UDP peer {%s, %s}, error: %v", origin, dest, err)
-	}
-	return nil
-}
-
-// ClearEntriesForPortNAT uses the conntrack tool to delete the conntrack entries
-// for connections specified by the {dest IP, port} pair.
-// Known issue:
-// https://github.com/kubernetes/kubernetes/issues/59368
-func ClearEntriesForPortNAT(execer exec.Interface, dest string, port int, protocol v1.Protocol) error {
-	if port <= 0 {
-		return fmt.Errorf("wrong port number. The port number must be greater than zero")
-	}
-	parameters := parametersWithFamily(utilnet.IsIPv6String(dest), "-D", "-p", protoStr(protocol), "--dport", strconv.Itoa(port), "--dst-nat", dest)
-	err := Exec(execer, parameters...)
-	if err != nil && !strings.Contains(err.Error(), NoConnectionToDelete) {
-		return fmt.Errorf("error deleting conntrack entries for UDP port: %d, error: %v", port, err)
-	}
+	klog.V(4).InfoS("Cleared conntrack entries", "count", n)
 	return nil
 }

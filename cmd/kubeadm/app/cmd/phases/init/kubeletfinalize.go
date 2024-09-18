@@ -57,19 +57,19 @@ func NewKubeletFinalizePhase() workflow.Phase {
 				RunAllSiblings: true,
 			},
 			{
-				Name:         "experimental-cert-rotation",
+				Name:         "enable-client-cert-rotation",
 				Short:        "Enable kubelet client certificate rotation",
 				InheritFlags: []string{options.CfgPath, options.CertificatesDir, options.DryRun},
-				Run:          runKubeletFinalizeCertRotation,
+				Run:          runKubeletFinalizeEnableClientCertRotation,
 			},
 		},
 	}
 }
 
-// runKubeletFinalizeCertRotation detects if the kubelet certificate rotation is enabled
+// runKubeletFinalizeEnableClientCertRotation detects if the kubelet certificate rotation is enabled
 // and updates the kubelet.conf file to point to a rotatable certificate and key for the
 // Node user.
-func runKubeletFinalizeCertRotation(c workflow.RunData) error {
+func runKubeletFinalizeEnableClientCertRotation(c workflow.RunData) error {
 	data, ok := c.(InitData)
 	if !ok {
 		return errors.New("kubelet-finalize phase invoked with an invalid data struct")
@@ -114,7 +114,17 @@ func runKubeletFinalizeCertRotation(c workflow.RunData) error {
 	}
 
 	// Perform basic validation. The errors here can only happen if the kubelet.conf was corrupted.
-	userName := fmt.Sprintf("%s%s", kubeadmconstants.NodesUserPrefix, cfg.NodeRegistration.Name)
+	if len(kubeconfig.CurrentContext) == 0 {
+		return errors.Errorf("the file %q does not have current context set", kubeconfigPath)
+	}
+	currentContext, ok := kubeconfig.Contexts[kubeconfig.CurrentContext]
+	if !ok {
+		return errors.Errorf("the file %q is not a valid kubeconfig: %q set as current-context, but not found in context list", kubeconfigPath, kubeconfig.CurrentContext)
+	}
+	userName := currentContext.AuthInfo
+	if len(userName) == 0 {
+		return errors.Errorf("the file %q is not a valid kubeconfig: empty username for current context", kubeconfigPath)
+	}
 	info, ok := kubeconfig.AuthInfos[userName]
 	if !ok {
 		return errors.Errorf("the file %q does not contain authentication for user %q", kubeconfigPath, cfg.NodeRegistration.Name)

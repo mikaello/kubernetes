@@ -31,7 +31,7 @@ import (
 
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmscheme "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/scheme"
-	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
 	"k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/validation"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	phases "k8s.io/kubernetes/cmd/kubeadm/app/cmd/phases/init"
@@ -118,7 +118,11 @@ func newCmdInit(out io.Writer, initOptions *initOptions) *cobra.Command {
 				return err
 			}
 
-			data := c.(*initData)
+			data, ok := c.(*initData)
+			if !ok {
+				return errors.New("invalid data struct")
+			}
+
 			fmt.Printf("[init] Using Kubernetes version: %s\n", data.cfg.KubernetesVersion)
 
 			return initRunner.Run(args)
@@ -496,22 +500,32 @@ func (d *initData) OutputWriter() io.Writer {
 	return d.outputWriter
 }
 
+// getDryRunClient creates a fake client that answers some GET calls in order to be able to do the full init flow in dry-run mode.
+func getDryRunClient(d *initData) (clientset.Interface, error) {
+	svcSubnetCIDR, err := kubeadmconstants.GetKubernetesServiceCIDR(d.cfg.Networking.ServiceSubnet)
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to get internal Kubernetes Service IP from the given service CIDR (%s)", d.cfg.Networking.ServiceSubnet)
+	}
+	dryRunGetter := apiclient.NewInitDryRunGetter(d.cfg.NodeRegistration.Name, svcSubnetCIDR.String())
+	return apiclient.NewDryRunClient(dryRunGetter, os.Stdout), nil
+}
+
 // Client returns a Kubernetes client to be used by kubeadm.
 // This function is implemented as a singleton, thus avoiding to recreate the client when it is used by different phases.
 // Important. This function must be called after the admin.conf kubeconfig file is created.
 func (d *initData) Client() (clientset.Interface, error) {
+	var err error
 	if d.client == nil {
 		if d.dryRun {
-			svcSubnetCIDR, err := kubeadmconstants.GetKubernetesServiceCIDR(d.cfg.Networking.ServiceSubnet)
+			d.client, err = getDryRunClient(d)
 			if err != nil {
-				return nil, errors.Wrapf(err, "unable to get internal Kubernetes Service IP from the given service CIDR (%s)", d.cfg.Networking.ServiceSubnet)
+				return nil, err
 			}
-			// If we're dry-running, we should create a faked client that answers some GETs in order to be able to do the full init flow and just logs the rest of requests
-			dryRunGetter := apiclient.NewInitDryRunGetter(d.cfg.NodeRegistration.Name, svcSubnetCIDR.String())
-			d.client = apiclient.NewDryRunClient(dryRunGetter, os.Stdout)
 		} else { // Use a real client
-			var err error
-			if !d.adminKubeConfigBootstrapped {
+			isDefaultKubeConfigPath := d.KubeConfigPath() == kubeadmconstants.GetAdminKubeConfigPath()
+			// Only bootstrap the admin.conf if it's used by the user (i.e. --kubeconfig has its default value)
+			// and if the bootstrapping was not already done
+			if !d.adminKubeConfigBootstrapped && isDefaultKubeConfigPath {
 				// Call EnsureAdminClusterRoleBinding() to obtain a working client from admin.conf.
 				d.client, err = kubeconfigphase.EnsureAdminClusterRoleBinding(kubeadmconstants.KubernetesDir, nil)
 				if err != nil {
@@ -519,8 +533,7 @@ func (d *initData) Client() (clientset.Interface, error) {
 				}
 				d.adminKubeConfigBootstrapped = true
 			} else {
-				// In case adminKubeConfigBootstrapped is already set just return a client from the default
-				// kubeconfig location.
+				// Alternatively, just load the config pointed at the --kubeconfig path
 				d.client, err = kubeconfigutil.ClientSetFromFile(d.KubeConfigPath())
 				if err != nil {
 					return nil, err
@@ -529,6 +542,28 @@ func (d *initData) Client() (clientset.Interface, error) {
 		}
 	}
 	return d.client, nil
+}
+
+// ClientWithoutBootstrap returns a dry-run client or a regular client from admin.conf.
+// Unlike Client(), it does not call EnsureAdminClusterRoleBinding() or sets d.client.
+// This means the client only has anonymous permissions and does not persist in initData.
+func (d *initData) ClientWithoutBootstrap() (clientset.Interface, error) {
+	var (
+		client clientset.Interface
+		err    error
+	)
+	if d.dryRun {
+		client, err = getDryRunClient(d)
+		if err != nil {
+			return nil, err
+		}
+	} else { // Use a real client
+		client, err = kubeconfigutil.ClientSetFromFile(d.KubeConfigPath())
+		if err != nil {
+			return nil, err
+		}
+	}
+	return client, nil
 }
 
 // Tokens returns an array of token strings.

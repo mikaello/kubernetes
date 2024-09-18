@@ -1,3 +1,6 @@
+//go:build linux
+// +build linux
+
 /*
 Copyright 2022 The Kubernetes Authors.
 
@@ -159,7 +162,7 @@ func TestNumberIptablesRules(t *testing.T) {
 			services:            1,
 			epPerService:        1,
 			expectedFilterRules: 5,
-			expectedNatRules:    17,
+			expectedNatRules:    18,
 		},
 		{
 			name: "1 Services 2 EndpointPerService - LoadBalancer",
@@ -174,7 +177,7 @@ func TestNumberIptablesRules(t *testing.T) {
 			services:            1,
 			epPerService:        2,
 			expectedFilterRules: 5,
-			expectedNatRules:    20,
+			expectedNatRules:    21,
 		},
 		{
 			name: "1 Services 10 EndpointPerService - LoadBalancer",
@@ -189,7 +192,7 @@ func TestNumberIptablesRules(t *testing.T) {
 			services:            1,
 			epPerService:        10,
 			expectedFilterRules: 5,
-			expectedNatRules:    44,
+			expectedNatRules:    45,
 		},
 		{
 			name: "10 Services 0 EndpointsPerService - LoadBalancer",
@@ -219,7 +222,7 @@ func TestNumberIptablesRules(t *testing.T) {
 			services:            10,
 			epPerService:        1,
 			expectedFilterRules: 14,
-			expectedNatRules:    125,
+			expectedNatRules:    135,
 		},
 		{
 			name: "10 Services 2 EndpointPerService - LoadBalancer",
@@ -234,7 +237,7 @@ func TestNumberIptablesRules(t *testing.T) {
 			services:            10,
 			epPerService:        2,
 			expectedFilterRules: 14,
-			expectedNatRules:    155,
+			expectedNatRules:    165,
 		},
 		{
 			name: "10 Services 10 EndpointPerService - LoadBalancer",
@@ -249,7 +252,7 @@ func TestNumberIptablesRules(t *testing.T) {
 			services:            10,
 			epPerService:        10,
 			expectedFilterRules: 14,
-			expectedNatRules:    395,
+			expectedNatRules:    405,
 		},
 	}
 

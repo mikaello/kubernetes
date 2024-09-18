@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -46,7 +47,10 @@ func quantityMustParse(value string) *resource.Quantity {
 
 func TestGetReclaimableThreshold(t *testing.T) {
 	testCases := map[string]struct {
-		thresholds []evictionapi.Threshold
+		thresholds                   []evictionapi.Threshold
+		expectedThreshold            evictionapi.Threshold
+		expectedResourceName         v1.ResourceName
+		expectedReclaimableToBeFound bool
 	}{
 		"": {
 			thresholds: []evictionapi.Threshold{
@@ -90,15 +94,51 @@ func TestGetReclaimableThreshold(t *testing.T) {
 						Quantity: quantityMustParse("1Gi"),
 					},
 				},
+				{
+					Signal:   evictionapi.SignalContainerFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("100Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1Gi"),
+					},
+				},
 			},
+			expectedThreshold: evictionapi.Threshold{
+				Signal:   evictionapi.Signal("memory.available"),
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("150Mi"),
+				},
+			},
+			expectedResourceName:         v1.ResourceName("memory"),
+			expectedReclaimableToBeFound: true,
+		},
+		"no thresholds": {
+			thresholds:           []evictionapi.Threshold{},
+			expectedThreshold:    evictionapi.Threshold{},
+			expectedResourceName: v1.ResourceName(""),
+		},
+		"threshold was crossed but reclaim not implemented (invalid signal)": {
+			thresholds: []evictionapi.Threshold{
+				{
+					Signal: "mem.available",
+				},
+			},
+			expectedThreshold:    evictionapi.Threshold{},
+			expectedResourceName: v1.ResourceName(""),
 		},
 	}
-	for testName, testCase := range testCases {
+	for _, testCase := range testCases {
 		sort.Sort(byEvictionPriority(testCase.thresholds))
-		_, _, ok := getReclaimableThreshold(testCase.thresholds)
-		if !ok {
-			t.Errorf("Didn't find reclaimable threshold, test: %v", testName)
-		}
+		threshold, ressourceName, found := getReclaimableThreshold(testCase.thresholds)
+		assert.Equal(t, testCase.expectedReclaimableToBeFound, found)
+		assert.Equal(t, testCase.expectedResourceName, ressourceName)
+		assert.Equal(t, testCase.expectedThreshold.Signal, threshold.Signal)
+		assert.Equal(t, testCase.expectedThreshold.Operator, threshold.Operator)
+		assert.Equal(t, testCase.expectedThreshold.Value.Quantity.String(), threshold.Value.Quantity.String())
+		assert.Equal(t, testCase.expectedThreshold.GracePeriod, threshold.GracePeriod)
 	}
 }
 
@@ -445,6 +485,78 @@ func TestParseThresholdConfig(t *testing.T) {
 			expectErr:               true,
 			expectThresholds:        []evictionapi.Threshold{},
 		},
+		"min-reclaim-invalid-signal": {
+			allocatableConfig:       []string{},
+			evictionHard:            map[string]string{},
+			evictionSoft:            map[string]string{},
+			evictionSoftGracePeriod: map[string]string{},
+			evictionMinReclaim:      map[string]string{"mem.available": "300Mi"},
+			expectErr:               true,
+			expectThresholds:        []evictionapi.Threshold{},
+		},
+		"min-reclaim-empty-value": {
+			allocatableConfig:       []string{},
+			evictionHard:            map[string]string{},
+			evictionSoft:            map[string]string{},
+			evictionSoftGracePeriod: map[string]string{},
+			evictionMinReclaim:      map[string]string{"memory.available": ""},
+			expectErr:               true,
+			expectThresholds:        []evictionapi.Threshold{},
+		},
+		"min-reclaim-negative-percentage": {
+			allocatableConfig:       []string{},
+			evictionHard:            map[string]string{},
+			evictionSoft:            map[string]string{},
+			evictionSoftGracePeriod: map[string]string{},
+			evictionMinReclaim:      map[string]string{"memory.available": "-15%"},
+			expectErr:               true,
+			expectThresholds:        []evictionapi.Threshold{},
+		},
+		"min-reclaim-invalid-percentage": {
+			allocatableConfig:       []string{},
+			evictionHard:            map[string]string{},
+			evictionSoft:            map[string]string{},
+			evictionSoftGracePeriod: map[string]string{},
+			evictionMinReclaim:      map[string]string{"memory.available": "10..5%"},
+			expectErr:               true,
+			expectThresholds:        []evictionapi.Threshold{},
+		},
+		"hard-signal-empty-eviction-value": {
+			allocatableConfig:       []string{},
+			evictionHard:            map[string]string{"memory.available": ""},
+			evictionSoft:            map[string]string{},
+			evictionSoftGracePeriod: map[string]string{},
+			evictionMinReclaim:      map[string]string{},
+			expectErr:               true,
+			expectThresholds:        []evictionapi.Threshold{},
+		},
+		"hard-signal-invalid-float-percentage": {
+			allocatableConfig:       []string{},
+			evictionHard:            map[string]string{"memory.available": "10..5%"},
+			evictionSoft:            map[string]string{},
+			evictionSoftGracePeriod: map[string]string{},
+			evictionMinReclaim:      map[string]string{},
+			expectErr:               true,
+			expectThresholds:        []evictionapi.Threshold{},
+		},
+		"soft-grace-period-invalid-signal": {
+			allocatableConfig:       []string{},
+			evictionHard:            map[string]string{},
+			evictionSoft:            map[string]string{"memory.available": "150Mi"},
+			evictionSoftGracePeriod: map[string]string{"mem.available": "30s"},
+			evictionMinReclaim:      map[string]string{},
+			expectErr:               true,
+			expectThresholds:        []evictionapi.Threshold{},
+		},
+		"soft-invalid-grace-period": {
+			allocatableConfig:       []string{},
+			evictionHard:            map[string]string{},
+			evictionSoft:            map[string]string{"memory.available": "150Mi"},
+			evictionSoftGracePeriod: map[string]string{"memory.available": "30mins"},
+			evictionMinReclaim:      map[string]string{},
+			expectErr:               true,
+			expectThresholds:        []evictionapi.Threshold{},
+		},
 	}
 	for testName, testCase := range testCases {
 		thresholds, err := ParseThresholdConfig(testCase.allocatableConfig, testCase.evictionHard, testCase.evictionSoft, testCase.evictionSoftGracePeriod, testCase.evictionMinReclaim)
@@ -634,6 +746,47 @@ func TestAddAllocatableThresholds(t *testing.T) {
 			if !thresholdsEqual(testCase.expected, addAllocatableThresholds(testCase.thresholds)) {
 				t.Errorf("Err not as expected, test: %v, Unexpected data: %s", testName, cmp.Diff(testCase.expected, addAllocatableThresholds(testCase.thresholds)))
 			}
+		})
+	}
+}
+
+func TestFallbackResourcesUsage(t *testing.T) {
+	for _, test := range []struct {
+		description   string
+		usageFuncName string
+		usageFunc     func() int64
+	}{
+		{
+			description:   "disk usage, fallback value",
+			usageFuncName: "diskUsage",
+			usageFunc: func() int64 {
+				return diskUsage(&statsapi.FsStats{}).Value()
+			},
+		},
+		{
+			description:   "inode usage, fallback value",
+			usageFuncName: "inodeUsage",
+			usageFunc: func() int64 {
+				return inodeUsage(&statsapi.FsStats{}).Value()
+			},
+		},
+		{
+			description:   "memory usage, fallback value",
+			usageFuncName: "memoryUsage",
+			usageFunc: func() int64 {
+				return memoryUsage(&statsapi.MemoryStats{}).Value()
+			},
+		},
+		{
+			description:   "process usage, fallback value",
+			usageFuncName: "processUsage",
+			usageFunc: func() int64 {
+				return int64(processUsage(&statsapi.ProcessStats{}))
+			},
+		},
+	} {
+		t.Run(test.description, func(t *testing.T) {
+			assert.NotEqual(t, 0, test.usageFunc(), fmt.Sprintf("%s: unexpected fallback value", test.usageFuncName))
 		})
 	}
 }
@@ -1232,6 +1385,12 @@ func TestMakeSignalObservations(t *testing.T) {
 	imageFsInodes := uint64(1024 * 1024)
 	nodeFsInodesFree := uint64(1024)
 	nodeFsInodes := uint64(1024 * 1024)
+	containerFsAvailableBytes := uint64(1024 * 1024 * 2)
+	containerFsCapacityBytes := uint64(1024 * 1024 * 8)
+	containerFsInodesFree := uint64(1024 * 2)
+	containerFsInodes := uint64(1024 * 2)
+	maxPID := int64(255816)
+	numberOfRunningProcesses := int64(1000)
 	fakeStats := &statsapi.Summary{
 		Node: statsapi.NodeStats{
 			Memory: &statsapi.MemoryStats{
@@ -1245,6 +1404,16 @@ func TestMakeSignalObservations(t *testing.T) {
 					InodesFree:     &imageFsInodesFree,
 					Inodes:         &imageFsInodes,
 				},
+				ContainerFs: &statsapi.FsStats{
+					AvailableBytes: &containerFsAvailableBytes,
+					CapacityBytes:  &containerFsCapacityBytes,
+					InodesFree:     &containerFsInodesFree,
+					Inodes:         &containerFsInodes,
+				},
+			},
+			Rlimit: &statsapi.RlimitStats{
+				MaxPID:                &maxPID,
+				NumOfRunningProcesses: &numberOfRunningProcesses,
 			},
 			Fs: &statsapi.FsStats{
 				AvailableBytes: &nodeFsAvailableBytes,
@@ -1253,11 +1422,20 @@ func TestMakeSignalObservations(t *testing.T) {
 				Inodes:         &nodeFsInodes,
 			},
 			SystemContainers: []statsapi.ContainerStats{
+				// Used for memory signal observations on linux
 				{
 					Name: statsapi.SystemContainerPods,
 					Memory: &statsapi.MemoryStats{
 						AvailableBytes:  &nodeAvailableBytes,
 						WorkingSetBytes: &nodeWorkingSetBytes,
+					},
+				},
+				// Used for memory signal observations on windows
+				{
+					Name: statsapi.SystemContainerWindowsGlobalCommitMemory,
+					Memory: &statsapi.MemoryStats{
+						AvailableBytes: &nodeAvailableBytes,
+						UsageBytes:     &nodeWorkingSetBytes,
 					},
 				},
 			},
@@ -1281,7 +1459,7 @@ func TestMakeSignalObservations(t *testing.T) {
 	actualObservations, statsFunc := makeSignalObservations(fakeStats)
 	allocatableMemQuantity, found := actualObservations[evictionapi.SignalAllocatableMemoryAvailable]
 	if !found {
-		t.Errorf("Expected allocatable memory observation, but didnt find one")
+		t.Errorf("Expected allocatable memory observation, but didn't find one")
 	}
 	if expectedBytes := int64(nodeAvailableBytes); allocatableMemQuantity.available.Value() != expectedBytes {
 		t.Errorf("Expected %v, actual: %v", expectedBytes, allocatableMemQuantity.available.Value())
@@ -1329,6 +1507,16 @@ func TestMakeSignalObservations(t *testing.T) {
 	if expectedBytes := int64(imageFsCapacityBytes); imageFsQuantity.capacity.Value() != expectedBytes {
 		t.Errorf("Expected %v, actual: %v", expectedBytes, imageFsQuantity.capacity.Value())
 	}
+	containerFsQuantity, found := actualObservations[evictionapi.SignalContainerFsAvailable]
+	if !found {
+		t.Error("Expected available containerfs observation")
+	}
+	if expectedBytes := int64(containerFsAvailableBytes); containerFsQuantity.available.Value() != expectedBytes {
+		t.Errorf("Expected %v, actual: %v", expectedBytes, containerFsQuantity.available.Value())
+	}
+	if expectedBytes := int64(containerFsCapacityBytes); containerFsQuantity.capacity.Value() != expectedBytes {
+		t.Errorf("Expected %v, actual: %v", expectedBytes, containerFsQuantity.capacity.Value())
+	}
 	imageFsInodesQuantity, found := actualObservations[evictionapi.SignalImageFsInodesFree]
 	if !found {
 		t.Error("Expected inodes free imagefs observation")
@@ -1338,6 +1526,27 @@ func TestMakeSignalObservations(t *testing.T) {
 	}
 	if expected := int64(imageFsInodes); imageFsInodesQuantity.capacity.Value() != expected {
 		t.Errorf("Expected %v, actual: %v", expected, imageFsInodesQuantity.capacity.Value())
+	}
+	containerFsInodesQuantity, found := actualObservations[evictionapi.SignalContainerFsInodesFree]
+	if !found {
+		t.Error("Expected indoes free containerfs observation")
+	}
+	if expected := int64(containerFsInodesFree); containerFsInodesQuantity.available.Value() != expected {
+		t.Errorf("Expected %v, actual: %v", expected, containerFsInodesQuantity.available.Value())
+	}
+	if expected := int64(containerFsInodes); containerFsInodesQuantity.capacity.Value() != expected {
+		t.Errorf("Expected %v, actual: %v", expected, containerFsInodesQuantity.capacity.Value())
+	}
+
+	pidQuantity, found := actualObservations[evictionapi.SignalPIDAvailable]
+	if !found {
+		t.Error("Expected available memory observation")
+	}
+	if expectedBytes := int64(maxPID); pidQuantity.capacity.Value() != expectedBytes {
+		t.Errorf("Expected %v, actual: %v", expectedBytes, pidQuantity.capacity.Value())
+	}
+	if expectedBytes := int64(maxPID - numberOfRunningProcesses); pidQuantity.available.Value() != expectedBytes {
+		t.Errorf("Expected %v, actual: %v", expectedBytes, pidQuantity.available.Value())
 	}
 	for _, pod := range pods {
 		podStats, found := statsFunc(pod)
@@ -1953,6 +2162,1006 @@ func TestCompareThresholdValue(t *testing.T) {
 		}
 	}
 }
+func TestAddContainerFsThresholds(t *testing.T) {
+	gracePeriod := time.Duration(1)
+	testCases := []struct {
+		description                   string
+		imageFs                       bool
+		containerFs                   bool
+		expectedContainerFsHard       evictionapi.Threshold
+		expectedContainerFsSoft       evictionapi.Threshold
+		expectedContainerFsINodesHard evictionapi.Threshold
+		expectedContainerFsINodesSoft evictionapi.Threshold
+		expectErr                     bool
+		thresholdList                 []evictionapi.Threshold
+	}{
+		{
+			description: "single filesystem",
+			imageFs:     false,
+			containerFs: false,
+			expectedContainerFsHard: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsAvailable,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("100Mi"),
+				},
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("1Gi"),
+				},
+			},
+			expectedContainerFsSoft: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsAvailable,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("200Mi"),
+				},
+				GracePeriod: gracePeriod,
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("1Gi"),
+				},
+			},
+			expectedContainerFsINodesHard: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsInodesFree,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("100Mi"),
+				},
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("1Gi"),
+				},
+			},
+			expectedContainerFsINodesSoft: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsInodesFree,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("200Mi"),
+				},
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("2Gi"),
+				},
+				GracePeriod: gracePeriod,
+			},
+
+			thresholdList: []evictionapi.Threshold{
+				{
+					Signal:   evictionapi.SignalNodeFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("100Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalNodeFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("200Mi"),
+					},
+					GracePeriod: gracePeriod,
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalNodeFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("200Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+					GracePeriod: gracePeriod,
+				},
+				{
+					Signal:   evictionapi.SignalNodeFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("100Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalImageFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("100Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1Gi"),
+					},
+				},
+
+				{
+					Signal:   evictionapi.SignalImageFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("300Mi"),
+					},
+					GracePeriod: gracePeriod,
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalImageFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("150Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+					GracePeriod: gracePeriod,
+				},
+				{
+					Signal:   evictionapi.SignalImageFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("150Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+				},
+			},
+		},
+		{
+			description: "image filesystem",
+			imageFs:     true,
+			containerFs: false,
+			expectedContainerFsHard: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsAvailable,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("150Mi"),
+				},
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("1.5Gi"),
+				},
+			},
+			expectedContainerFsSoft: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsAvailable,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("300Mi"),
+				},
+				GracePeriod: gracePeriod,
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("3Gi"),
+				},
+			},
+			expectedContainerFsINodesHard: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsInodesFree,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("300Mi"),
+				},
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("2Gi"),
+				},
+			},
+			expectedContainerFsINodesSoft: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsInodesFree,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("150Mi"),
+				},
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("2Gi"),
+				},
+				GracePeriod: gracePeriod,
+			},
+			thresholdList: []evictionapi.Threshold{
+				{
+					Signal:   evictionapi.SignalNodeFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("100Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalNodeFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("200Mi"),
+					},
+					GracePeriod: gracePeriod,
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalNodeFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("200Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+					GracePeriod: gracePeriod,
+				},
+				{
+					Signal:   evictionapi.SignalNodeFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("150Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1.5Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalImageFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("150Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1.5Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalImageFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("300Mi"),
+					},
+					GracePeriod: gracePeriod,
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("3Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalImageFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("150Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+					GracePeriod: gracePeriod,
+				},
+				{
+					Signal:   evictionapi.SignalImageFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("300Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+				},
+			},
+		},
+		{
+			description: "container and image are separate",
+			imageFs:     true,
+			containerFs: true,
+			expectedContainerFsHard: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsAvailable,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("100Mi"),
+				},
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("1Gi"),
+				},
+			},
+			expectedContainerFsSoft: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsAvailable,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("200Mi"),
+				},
+				GracePeriod: gracePeriod,
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("1Gi"),
+				},
+			},
+			expectedContainerFsINodesHard: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsInodesFree,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("100Mi"),
+				},
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("1Gi"),
+				},
+			},
+			expectedContainerFsINodesSoft: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsInodesFree,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("200Mi"),
+				},
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("2Gi"),
+				},
+				GracePeriod: gracePeriod,
+			},
+			thresholdList: []evictionapi.Threshold{
+				{
+					Signal:   evictionapi.SignalNodeFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("100Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalNodeFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("200Mi"),
+					},
+					GracePeriod: gracePeriod,
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalNodeFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("200Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+					GracePeriod: gracePeriod,
+				},
+				{
+					Signal:   evictionapi.SignalNodeFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("100Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalImageFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("150Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1.5Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalImageFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("300Mi"),
+					},
+					GracePeriod: gracePeriod,
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("3Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalImageFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("150Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+					GracePeriod: gracePeriod,
+				},
+				{
+					Signal:   evictionapi.SignalImageFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("300Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+				},
+			},
+		},
+		{
+			description: "single filesystem; existing containerfsstats",
+			imageFs:     false,
+			containerFs: false,
+			expectErr:   true,
+			expectedContainerFsHard: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsAvailable,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("100Mi"),
+				},
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("1Gi"),
+				},
+			},
+			expectedContainerFsSoft: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsAvailable,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("200Mi"),
+				},
+				GracePeriod: gracePeriod,
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("1Gi"),
+				},
+			},
+			expectedContainerFsINodesHard: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsInodesFree,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("100Mi"),
+				},
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("1Gi"),
+				},
+			},
+			expectedContainerFsINodesSoft: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsInodesFree,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("200Mi"),
+				},
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("2Gi"),
+				},
+				GracePeriod: gracePeriod,
+			},
+
+			thresholdList: []evictionapi.Threshold{
+				{
+					Signal:   evictionapi.SignalNodeFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("100Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalNodeFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("200Mi"),
+					},
+					GracePeriod: gracePeriod,
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalNodeFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("200Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+					GracePeriod: gracePeriod,
+				},
+				{
+					Signal:   evictionapi.SignalNodeFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("100Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalImageFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("100Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1Gi"),
+					},
+				},
+
+				{
+					Signal:   evictionapi.SignalImageFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("300Mi"),
+					},
+					GracePeriod: gracePeriod,
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalImageFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("150Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+					GracePeriod: gracePeriod,
+				},
+				{
+					Signal:   evictionapi.SignalImageFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("150Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalContainerFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("500Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("5Gi"),
+					},
+				},
+
+				{
+					Signal:   evictionapi.SignalContainerFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("500Mi"),
+					},
+					GracePeriod: gracePeriod,
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("5Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalContainerFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("500Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("5Gi"),
+					},
+					GracePeriod: gracePeriod,
+				},
+				{
+					Signal:   evictionapi.SignalContainerFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("500Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("5Gi"),
+					},
+				},
+			},
+		},
+		{
+			description: "image filesystem; expect error",
+			imageFs:     true,
+			containerFs: false,
+			expectErr:   true,
+			expectedContainerFsHard: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsAvailable,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("150Mi"),
+				},
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("1.5Gi"),
+				},
+			},
+			expectedContainerFsSoft: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsAvailable,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("300Mi"),
+				},
+				GracePeriod: gracePeriod,
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("3Gi"),
+				},
+			},
+			expectedContainerFsINodesHard: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsInodesFree,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("300Mi"),
+				},
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("2Gi"),
+				},
+			},
+			expectedContainerFsINodesSoft: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsInodesFree,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("150Mi"),
+				},
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("2Gi"),
+				},
+				GracePeriod: gracePeriod,
+			},
+			thresholdList: []evictionapi.Threshold{
+				{
+					Signal:   evictionapi.SignalNodeFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("100Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalNodeFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("200Mi"),
+					},
+					GracePeriod: gracePeriod,
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalNodeFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("200Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+					GracePeriod: gracePeriod,
+				},
+				{
+					Signal:   evictionapi.SignalNodeFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("150Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1.5Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalImageFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("150Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1.5Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalImageFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("300Mi"),
+					},
+					GracePeriod: gracePeriod,
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("3Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalImageFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("150Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+					GracePeriod: gracePeriod,
+				},
+				{
+					Signal:   evictionapi.SignalImageFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("300Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalContainerFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("500Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("5Gi"),
+					},
+				},
+
+				{
+					Signal:   evictionapi.SignalContainerFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("500Mi"),
+					},
+					GracePeriod: gracePeriod,
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("5Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalContainerFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("500Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("5Gi"),
+					},
+					GracePeriod: gracePeriod,
+				},
+				{
+					Signal:   evictionapi.SignalContainerFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("500Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("5Gi"),
+					},
+				},
+			},
+		},
+		{
+			description: "container and image are separate; expect error",
+			imageFs:     true,
+			containerFs: true,
+			expectErr:   true,
+			expectedContainerFsHard: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsAvailable,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("100Mi"),
+				},
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("1Gi"),
+				},
+			},
+			expectedContainerFsSoft: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsAvailable,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("200Mi"),
+				},
+				GracePeriod: gracePeriod,
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("1Gi"),
+				},
+			},
+			expectedContainerFsINodesHard: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsInodesFree,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("100Mi"),
+				},
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("1Gi"),
+				},
+			},
+			expectedContainerFsINodesSoft: evictionapi.Threshold{
+				Signal:   evictionapi.SignalContainerFsInodesFree,
+				Operator: evictionapi.OpLessThan,
+				Value: evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("200Mi"),
+				},
+				MinReclaim: &evictionapi.ThresholdValue{
+					Quantity: quantityMustParse("2Gi"),
+				},
+				GracePeriod: gracePeriod,
+			},
+			thresholdList: []evictionapi.Threshold{
+				{
+					Signal:   evictionapi.SignalNodeFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("100Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalNodeFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("200Mi"),
+					},
+					GracePeriod: gracePeriod,
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalNodeFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("200Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+					GracePeriod: gracePeriod,
+				},
+				{
+					Signal:   evictionapi.SignalNodeFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("100Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalImageFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("150Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("1.5Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalImageFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("300Mi"),
+					},
+					GracePeriod: gracePeriod,
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("3Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalImageFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("150Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+					GracePeriod: gracePeriod,
+				},
+				{
+					Signal:   evictionapi.SignalImageFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("300Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("2Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalContainerFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("500Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("5Gi"),
+					},
+				},
+
+				{
+					Signal:   evictionapi.SignalContainerFsAvailable,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("500Mi"),
+					},
+					GracePeriod: gracePeriod,
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("5Gi"),
+					},
+				},
+				{
+					Signal:   evictionapi.SignalContainerFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("500Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("5Gi"),
+					},
+					GracePeriod: gracePeriod,
+				},
+				{
+					Signal:   evictionapi.SignalContainerFsInodesFree,
+					Operator: evictionapi.OpLessThan,
+					Value: evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("500Mi"),
+					},
+					MinReclaim: &evictionapi.ThresholdValue{
+						Quantity: quantityMustParse("5Gi"),
+					},
+				},
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.description, func(t *testing.T) {
+			expected, err := UpdateContainerFsThresholds(testCase.thresholdList, testCase.imageFs, testCase.containerFs)
+			if err != nil && !testCase.expectErr {
+				t.Fatalf("got error but did not expect any")
+			}
+			hardContainerFsMatch := -1
+			softContainerFsMatch := -1
+			hardContainerFsINodesMatch := -1
+			softContainerFsINodesMatch := -1
+			for idx, val := range expected {
+				if val.Signal == evictionapi.SignalContainerFsAvailable && isHardEvictionThreshold(val) {
+					if !reflect.DeepEqual(val, testCase.expectedContainerFsHard) {
+						t.Fatalf("want %v got %v", testCase.expectedContainerFsHard, val)
+					}
+					hardContainerFsMatch = idx
+				}
+				if val.Signal == evictionapi.SignalContainerFsAvailable && !isHardEvictionThreshold(val) {
+					if !reflect.DeepEqual(val, testCase.expectedContainerFsSoft) {
+						t.Fatalf("want %v got %v", testCase.expectedContainerFsSoft, val)
+					}
+					softContainerFsMatch = idx
+				}
+				if val.Signal == evictionapi.SignalContainerFsInodesFree && isHardEvictionThreshold(val) {
+					if !reflect.DeepEqual(val, testCase.expectedContainerFsINodesHard) {
+						t.Fatalf("want %v got %v", testCase.expectedContainerFsINodesHard, val)
+					}
+					hardContainerFsINodesMatch = idx
+				}
+				if val.Signal == evictionapi.SignalContainerFsInodesFree && !isHardEvictionThreshold(val) {
+					if !reflect.DeepEqual(val, testCase.expectedContainerFsINodesSoft) {
+						t.Fatalf("want %v got %v", testCase.expectedContainerFsINodesSoft, val)
+					}
+					softContainerFsINodesMatch = idx
+				}
+			}
+			if hardContainerFsMatch == -1 {
+				t.Fatalf("did not find hard containerfs.available")
+			}
+			if softContainerFsMatch == -1 {
+				t.Fatalf("did not find soft containerfs.available")
+			}
+			if hardContainerFsINodesMatch == -1 {
+				t.Fatalf("did not find hard containerfs.inodesfree")
+			}
+			if softContainerFsINodesMatch == -1 {
+				t.Fatalf("did not find soft containerfs.inodesfree")
+			}
+		})
+	}
+}
 
 // newPodInodeStats returns stats with specified usage amounts.
 func newPodInodeStats(pod *v1.Pod, rootFsInodesUsed, logsInodesUsed, perLocalVolumeInodesUsed resource.Quantity) statsapi.PodStats {
@@ -1996,8 +3205,9 @@ func newPodDiskStats(pod *v1.Pod, rootFsUsed, logsUsed, perLocalVolumeUsed resou
 
 	rootFsUsedBytes := uint64(rootFsUsed.Value())
 	logsUsedBytes := uint64(logsUsed.Value())
-	for range pod.Spec.Containers {
+	for _, container := range pod.Spec.Containers {
 		result.Containers = append(result.Containers, statsapi.ContainerStats{
+			Name: container.Name,
 			Rootfs: &statsapi.FsStats{
 				UsedBytes: &rootFsUsedBytes,
 			},
@@ -2178,7 +3388,7 @@ func TestEvictonMessageWithResourceResize(t *testing.T) {
 
 	for _, enabled := range []bool{true, false} {
 		t.Run(fmt.Sprintf("InPlacePodVerticalScaling enabled=%v", enabled), func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, enabled)()
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, enabled)
 			msg, _ := evictionMessage(v1.ResourceMemory, testpod, statsFn, threshold, observations)
 			if enabled {
 				if !strings.Contains(msg, "testcontainer was using 150Mi, request is 100Mi") {
@@ -2189,6 +3399,52 @@ func TestEvictonMessageWithResourceResize(t *testing.T) {
 					t.Errorf("Found 'exceeds memory' eviction message which was not expected.")
 				}
 			}
+		})
+	}
+}
+
+func TestStatsNotFoundForPod(t *testing.T) {
+	pod1 := newPod("fake-pod1", defaultPriority, []v1.Container{
+		newContainer("fake-container1", newResourceList("", "", ""), newResourceList("", "", "")),
+	}, nil)
+	pod2 := newPod("fake-pod2", defaultPriority, []v1.Container{
+		newContainer("fake-container2", newResourceList("", "", ""), newResourceList("", "", "")),
+	}, nil)
+	statsFn := func(pod *v1.Pod) (statsapi.PodStats, bool) {
+		return statsapi.PodStats{}, false
+	}
+
+	for _, test := range []struct {
+		description string
+		compFunc    func(stats statsFunc) cmpFunc
+	}{
+		{
+			description: "process",
+			compFunc:    process,
+		},
+		{
+			description: "memory",
+			compFunc:    memory,
+		},
+		{
+			description: "exceedMemoryRequests",
+			compFunc:    exceedMemoryRequests,
+		},
+		{
+			description: "exceedDiskRequests",
+			compFunc: func(stats statsFunc) cmpFunc {
+				return exceedDiskRequests(stats, nil, "")
+			},
+		},
+		{
+			description: "disk",
+			compFunc: func(stats statsFunc) cmpFunc {
+				return disk(stats, nil, "")
+			},
+		},
+	} {
+		t.Run(test.description, func(t *testing.T) {
+			assert.Equal(t, 0, test.compFunc(statsFn)(pod1, pod2), "unexpected default result")
 		})
 	}
 }

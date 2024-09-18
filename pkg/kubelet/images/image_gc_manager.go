@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,8 +33,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/record"
 	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/events"
 	"k8s.io/kubernetes/pkg/kubelet/metrics"
@@ -43,11 +46,22 @@ import (
 // instrumentationScope is OpenTelemetry instrumentation scope name
 const instrumentationScope = "k8s.io/kubernetes/pkg/kubelet/images"
 
+// When RuntimeClassInImageCriAPI feature gate is enabled, imageRecord is
+// indexed as imageId-RuntimeHandler
+const imageIndexTupleFormat = "%s,%s"
+
+// ImageGarbageCollectedTotalReason* specify the reason why an image was garbage collected
+// in the `image_garbage_collected_total` metric.
+const (
+	ImageGarbageCollectedTotalReasonAge   = "age"
+	ImageGarbageCollectedTotalReasonSpace = "space"
+)
+
 // StatsProvider is an interface for fetching stats used during image garbage
 // collection.
 type StatsProvider interface {
 	// ImageFsStats returns the stats of the image filesystem.
-	ImageFsStats(ctx context.Context) (*statsapi.FsStats, error)
+	ImageFsStats(ctx context.Context) (*statsapi.FsStats, *statsapi.FsStats, error)
 }
 
 // ImageGCManager is an interface for managing lifecycle of all images.
@@ -55,7 +69,7 @@ type StatsProvider interface {
 type ImageGCManager interface {
 	// Applies the garbage collection policy. Errors include being unable to free
 	// enough space as per the garbage collection policy.
-	GarbageCollect(ctx context.Context) error
+	GarbageCollect(ctx context.Context, beganGC time.Time) error
 
 	// Start async garbage collection of images.
 	Start()
@@ -90,7 +104,12 @@ type realImageGCManager struct {
 	// Container runtime
 	runtime container.Runtime
 
-	// Records of images and their use.
+	// Records of images and their use. Indexed by ImageId.
+	// If RuntimeClassInImageCriAPI feature gate is enabled, imageRecords
+	// are identified by a tuple of (imageId,runtimeHandler) that is passed
+	// from ListImages() call. If no runtimehandler is specified in response
+	// to ListImages() by the container runtime, only imageID will be used as
+	// the index of this map.
 	imageRecords     map[string]*imageRecord
 	imageRecordsLock sync.Mutex
 
@@ -105,9 +124,6 @@ type realImageGCManager struct {
 
 	// Reference to this node.
 	nodeRef *v1.ObjectReference
-
-	// Track initialization
-	initialized bool
 
 	// imageCache is the cache of latest image list.
 	imageCache imageCache
@@ -149,6 +165,8 @@ func (i *imageCache) get() []container.Image {
 
 // Information about the images we track.
 type imageRecord struct {
+	// runtime handler used to pull this image
+	runtimeHandlerUsedToPullImage string
 	// Time when this image was first detected.
 	firstDetected time.Time
 
@@ -182,7 +200,6 @@ func NewImageGCManager(runtime container.Runtime, statsProvider StatsProvider, r
 		statsProvider: statsProvider,
 		recorder:      recorder,
 		nodeRef:       nodeRef,
-		initialized:   false,
 		tracer:        tracer,
 	}
 
@@ -192,16 +209,9 @@ func NewImageGCManager(runtime container.Runtime, statsProvider StatsProvider, r
 func (im *realImageGCManager) Start() {
 	ctx := context.Background()
 	go wait.Until(func() {
-		// Initial detection make detected time "unknown" in the past.
-		var ts time.Time
-		if im.initialized {
-			ts = time.Now()
-		}
-		_, err := im.detectImages(ctx, ts)
+		_, err := im.detectImages(ctx, time.Now())
 		if err != nil {
 			klog.InfoS("Failed to monitor images", "err", err)
-		} else {
-			im.initialized = true
 		}
 	}, 5*time.Minute, wait.NeverStop)
 
@@ -222,8 +232,9 @@ func (im *realImageGCManager) GetImageList() ([]container.Image, error) {
 	return im.imageCache.get(), nil
 }
 
-func (im *realImageGCManager) detectImages(ctx context.Context, detectTime time.Time) (sets.String, error) {
-	imagesInUse := sets.NewString()
+func (im *realImageGCManager) detectImages(ctx context.Context, detectTime time.Time) (sets.Set[string], error) {
+	isRuntimeClassInImageCriAPIEnabled := utilfeature.DefaultFeatureGate.Enabled(features.RuntimeClassInImageCriAPI)
+	imagesInUse := sets.New[string]()
 
 	images, err := im.runtime.ListImages(ctx)
 	if err != nil {
@@ -237,39 +248,57 @@ func (im *realImageGCManager) detectImages(ctx context.Context, detectTime time.
 	// Make a set of images in use by containers.
 	for _, pod := range pods {
 		for _, container := range pod.Containers {
-			klog.V(5).InfoS("Container uses image", "pod", klog.KRef(pod.Namespace, pod.Name), "containerName", container.Name, "containerImage", container.Image, "imageID", container.ImageID)
-			imagesInUse.Insert(container.ImageID)
+			if err := im.handleImageVolumes(ctx, imagesInUse, container, pod, images); err != nil {
+				return imagesInUse, err
+			}
+
+			if !isRuntimeClassInImageCriAPIEnabled {
+				klog.V(5).InfoS("Container uses image", "pod", klog.KRef(pod.Namespace, pod.Name), "containerName", container.Name, "containerImage", container.Image, "imageID", container.ImageID, "imageRef", container.ImageRef)
+				imagesInUse.Insert(container.ImageID)
+			} else {
+				imageKey := getImageTuple(container.ImageID, container.ImageRuntimeHandler)
+				klog.V(5).InfoS("Container uses image", "pod", klog.KRef(pod.Namespace, pod.Name), "containerName", container.Name, "containerImage", container.Image, "imageID", container.ImageID, "imageRef", container.ImageRef, "imageKey", imageKey)
+				imagesInUse.Insert(imageKey)
+			}
 		}
 	}
 
 	// Add new images and record those being used.
 	now := time.Now()
-	currentImages := sets.NewString()
+	currentImages := sets.New[string]()
 	im.imageRecordsLock.Lock()
 	defer im.imageRecordsLock.Unlock()
 	for _, image := range images {
-		klog.V(5).InfoS("Adding image ID to currentImages", "imageID", image.ID)
-		currentImages.Insert(image.ID)
+		imageKey := image.ID
+		if !isRuntimeClassInImageCriAPIEnabled {
+			klog.V(5).InfoS("Adding image ID to currentImages", "imageID", imageKey)
+		} else {
+			imageKey = getImageTuple(image.ID, image.Spec.RuntimeHandler)
+			klog.V(5).InfoS("Adding image ID with runtime class to currentImages", "imageKey", imageKey, "runtimeHandler", image.Spec.RuntimeHandler)
+		}
+
+		currentImages.Insert(imageKey)
 
 		// New image, set it as detected now.
-		if _, ok := im.imageRecords[image.ID]; !ok {
-			klog.V(5).InfoS("Image ID is new", "imageID", image.ID)
-			im.imageRecords[image.ID] = &imageRecord{
-				firstDetected: detectTime,
+		if _, ok := im.imageRecords[imageKey]; !ok {
+			klog.V(5).InfoS("Image ID is new", "imageID", imageKey, "runtimeHandler", image.Spec.RuntimeHandler)
+			im.imageRecords[imageKey] = &imageRecord{
+				firstDetected:                 detectTime,
+				runtimeHandlerUsedToPullImage: image.Spec.RuntimeHandler,
 			}
 		}
 
 		// Set last used time to now if the image is being used.
-		if isImageUsed(image.ID, imagesInUse) {
-			klog.V(5).InfoS("Setting Image ID lastUsed", "imageID", image.ID, "lastUsed", now)
-			im.imageRecords[image.ID].lastUsed = now
+		if isImageUsed(imageKey, imagesInUse) {
+			klog.V(5).InfoS("Setting Image ID lastUsed", "imageID", imageKey, "lastUsed", now)
+			im.imageRecords[imageKey].lastUsed = now
 		}
 
-		klog.V(5).InfoS("Image ID has size", "imageID", image.ID, "size", image.Size)
-		im.imageRecords[image.ID].size = image.Size
+		klog.V(5).InfoS("Image ID has size", "imageID", imageKey, "size", image.Size)
+		im.imageRecords[imageKey].size = image.Size
 
-		klog.V(5).InfoS("Image ID is pinned", "imageID", image.ID, "pinned", image.Pinned)
-		im.imageRecords[image.ID].pinned = image.Pinned
+		klog.V(5).InfoS("Image ID is pinned", "imageID", imageKey, "pinned", image.Pinned)
+		im.imageRecords[imageKey].pinned = image.Pinned
 	}
 
 	// Remove old images from our records.
@@ -283,7 +312,30 @@ func (im *realImageGCManager) detectImages(ctx context.Context, detectTime time.
 	return imagesInUse, nil
 }
 
-func (im *realImageGCManager) GarbageCollect(ctx context.Context) error {
+// handleImageVolumes ensures that image volumes are considered as images in use.
+func (im *realImageGCManager) handleImageVolumes(ctx context.Context, imagesInUse sets.Set[string], container *container.Container, pod *container.Pod, images []container.Image) error {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ImageVolume) {
+		return nil
+	}
+
+	status, err := im.runtime.GetContainerStatus(ctx, container.ID)
+	if err != nil {
+		return fmt.Errorf("get container status: %w", err)
+	}
+
+	for _, mount := range status.Mounts {
+		for _, image := range images {
+			if mount.Image != nil && mount.Image.Image == image.ID {
+				klog.V(5).InfoS("Container uses image as mount", "pod", klog.KRef(pod.Namespace, pod.Name), "containerName", container.Name, "imageID", image.ID)
+				imagesInUse.Insert(image.ID)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (im *realImageGCManager) GarbageCollect(ctx context.Context, beganGC time.Time) error {
 	ctx, otelSpan := im.tracer.Start(ctx, "Images/GarbageCollect")
 	defer otelSpan.End()
 
@@ -293,13 +345,13 @@ func (im *realImageGCManager) GarbageCollect(ctx context.Context) error {
 		return err
 	}
 
-	images, err = im.freeOldImages(ctx, images, freeTime)
+	images, err = im.freeOldImages(ctx, images, freeTime, beganGC)
 	if err != nil {
 		return err
 	}
 
 	// Get disk usage on disk holding images.
-	fsStats, err := im.statsProvider.ImageFsStats(ctx)
+	fsStats, _, err := im.statsProvider.ImageFsStats(ctx)
 	if err != nil {
 		return err
 	}
@@ -344,8 +396,14 @@ func (im *realImageGCManager) GarbageCollect(ctx context.Context) error {
 	return nil
 }
 
-func (im *realImageGCManager) freeOldImages(ctx context.Context, images []evictionInfo, freeTime time.Time) ([]evictionInfo, error) {
+func (im *realImageGCManager) freeOldImages(ctx context.Context, images []evictionInfo, freeTime, beganGC time.Time) ([]evictionInfo, error) {
 	if im.policy.MaxAge == 0 {
+		return images, nil
+	}
+
+	// Wait until the MaxAge has passed since the Kubelet has started,
+	// or else we risk prematurely garbage collecting images.
+	if freeTime.Sub(beganGC) <= im.policy.MaxAge {
 		return images, nil
 	}
 	var deletionErrors []error
@@ -354,7 +412,7 @@ func (im *realImageGCManager) freeOldImages(ctx context.Context, images []evicti
 		klog.V(5).InfoS("Evaluating image ID for possible garbage collection based on image age", "imageID", image.id)
 		// Evaluate whether image is older than MaxAge.
 		if freeTime.Sub(image.lastUsed) > im.policy.MaxAge {
-			if err := im.freeImage(ctx, image); err != nil {
+			if err := im.freeImage(ctx, image, ImageGarbageCollectedTotalReasonAge); err != nil {
 				deletionErrors = append(deletionErrors, err)
 				remainingImages = append(remainingImages, image)
 				continue
@@ -391,7 +449,7 @@ func (im *realImageGCManager) freeSpace(ctx context.Context, bytesToFree int64, 
 	var deletionErrors []error
 	spaceFreed := int64(0)
 	for _, image := range images {
-		klog.V(5).InfoS("Evaluating image ID for possible garbage collection based on disk usage", "imageID", image.id)
+		klog.V(5).InfoS("Evaluating image ID for possible garbage collection based on disk usage", "imageID", image.id, "runtimeHandler", image.imageRecord.runtimeHandlerUsedToPullImage)
 		// Images that are currently in used were given a newer lastUsed.
 		if image.lastUsed.Equal(freeTime) || image.lastUsed.After(freeTime) {
 			klog.V(5).InfoS("Image ID was used too recently, not eligible for garbage collection", "imageID", image.id, "lastUsed", image.lastUsed, "freeTime", freeTime)
@@ -405,7 +463,7 @@ func (im *realImageGCManager) freeSpace(ctx context.Context, bytesToFree int64, 
 			continue
 		}
 
-		if err := im.freeImage(ctx, image); err != nil {
+		if err := im.freeImage(ctx, image, ImageGarbageCollectedTotalReasonSpace); err != nil {
 			deletionErrors = append(deletionErrors, err)
 			continue
 		}
@@ -422,20 +480,29 @@ func (im *realImageGCManager) freeSpace(ctx context.Context, bytesToFree int64, 
 	return spaceFreed, nil
 }
 
-func (im *realImageGCManager) freeImage(ctx context.Context, image evictionInfo) error {
+func (im *realImageGCManager) freeImage(ctx context.Context, image evictionInfo, reason string) error {
+	isRuntimeClassInImageCriAPIEnabled := utilfeature.DefaultFeatureGate.Enabled(features.RuntimeClassInImageCriAPI)
 	// Remove image. Continue despite errors.
-	klog.InfoS("Removing image to free bytes", "imageID", image.id, "size", image.size)
-	err := im.runtime.RemoveImage(ctx, container.ImageSpec{Image: image.id})
+	var err error
+	klog.InfoS("Removing image to free bytes", "imageID", image.id, "size", image.size, "runtimeHandler", image.runtimeHandlerUsedToPullImage)
+	err = im.runtime.RemoveImage(ctx, container.ImageSpec{Image: image.id, RuntimeHandler: image.runtimeHandlerUsedToPullImage})
 	if err != nil {
 		return err
 	}
-	delete(im.imageRecords, image.id)
-	metrics.ImageGarbageCollectedTotal.Inc()
+
+	imageKey := image.id
+	if isRuntimeClassInImageCriAPIEnabled {
+		imageKey = getImageTuple(image.id, image.runtimeHandlerUsedToPullImage)
+	}
+	delete(im.imageRecords, imageKey)
+
+	metrics.ImageGarbageCollectedTotal.WithLabelValues(reason).Inc()
 	return err
 }
 
 // Queries all of the image records and arranges them in a slice of evictionInfo, sorted based on last time used, ignoring images pinned by the runtime.
 func (im *realImageGCManager) imagesInEvictionOrder(ctx context.Context, freeTime time.Time) ([]evictionInfo, error) {
+	isRuntimeClassInImageCriAPIEnabled := utilfeature.DefaultFeatureGate.Enabled(features.RuntimeClassInImageCriAPI)
 	imagesInUse, err := im.detectImages(ctx, freeTime)
 	if err != nil {
 		return nil, err
@@ -457,13 +524,44 @@ func (im *realImageGCManager) imagesInEvictionOrder(ctx context.Context, freeTim
 			continue
 
 		}
-		images = append(images, evictionInfo{
-			id:          image,
-			imageRecord: *record,
-		})
+		if !isRuntimeClassInImageCriAPIEnabled {
+			images = append(images, evictionInfo{
+				id:          image,
+				imageRecord: *record,
+			})
+		} else {
+			imageID := getImageIDFromTuple(image)
+			// Ensure imageID is valid or else continue
+			if imageID == "" {
+				im.recorder.Eventf(im.nodeRef, v1.EventTypeWarning, "ImageID is not valid, skipping, ImageID: %v", imageID)
+				continue
+			}
+			images = append(images, evictionInfo{
+				id:          imageID,
+				imageRecord: *record,
+			})
+		}
 	}
 	sort.Sort(byLastUsedAndDetected(images))
 	return images, nil
+}
+
+// If RuntimeClassInImageCriAPI feature gate is enabled, imageRecords
+// are identified by a tuple of (imageId,runtimeHandler) that is passed
+// from ListImages() call. If no runtimehandler is specified in response
+// to ListImages() by the container runtime, only imageID will be will
+// be returned.
+func getImageTuple(imageID, runtimeHandler string) string {
+	if runtimeHandler == "" {
+		return imageID
+	}
+	return fmt.Sprintf(imageIndexTupleFormat, imageID, runtimeHandler)
+}
+
+// get imageID from the imageTuple
+func getImageIDFromTuple(image string) string {
+	imageTuples := strings.Split(image, ",")
+	return imageTuples[0]
 }
 
 type evictionInfo struct {
@@ -483,7 +581,7 @@ func (ev byLastUsedAndDetected) Less(i, j int) bool {
 	return ev[i].lastUsed.Before(ev[j].lastUsed)
 }
 
-func isImageUsed(imageID string, imagesInUse sets.String) bool {
+func isImageUsed(imageID string, imagesInUse sets.Set[string]) bool {
 	// Check the image ID.
 	if _, ok := imagesInUse[imageID]; ok {
 		return true

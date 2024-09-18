@@ -34,7 +34,7 @@ import (
 	admissionapi "k8s.io/pod-security-admission/api"
 )
 
-var _ = utils.SIGDescribe("GenericPersistentVolume[Disruptive]", func() {
+var _ = utils.SIGDescribe("GenericPersistentVolume", framework.WithDisruptive(), func() {
 	f := framework.NewDefaultFramework("generic-disruptive-pv")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 	var (
@@ -109,9 +109,6 @@ func createPodPVCFromSC(ctx context.Context, f *framework.Framework, c clientset
 	pvc, err = c.CoreV1().PersistentVolumeClaims(pvc.Namespace).Create(ctx, pvc, metav1.CreateOptions{})
 	framework.ExpectNoError(err, "Error creating pvc")
 	pvcClaims := []*v1.PersistentVolumeClaim{pvc}
-	pvs, err := e2epv.WaitForPVClaimBoundPhase(ctx, c, pvcClaims, framework.ClaimProvisionTimeout)
-	framework.ExpectNoError(err, "Failed waiting for PVC to be bound %v", err)
-	gomega.Expect(pvs).To(gomega.HaveLen(1))
 
 	ginkgo.By("Creating a pod with dynamically provisioned volume")
 	podConfig := e2epod.Config{
@@ -121,5 +118,11 @@ func createPodPVCFromSC(ctx context.Context, f *framework.Framework, c clientset
 	}
 	pod, err := e2epod.CreateSecPod(ctx, c, &podConfig, f.Timeouts.PodStart)
 	framework.ExpectNoError(err, "While creating pods for kubelet restart test")
+
+	ginkgo.By("Checking for bound PVC")
+	pvs, err := e2epv.WaitForPVClaimBoundPhase(ctx, c, pvcClaims, framework.ClaimProvisionTimeout)
+	framework.ExpectNoError(err, "Failed waiting for PVC to be bound %v", err)
+	gomega.Expect(pvs).To(gomega.HaveLen(1))
+
 	return pod, pvc, pvs[0]
 }

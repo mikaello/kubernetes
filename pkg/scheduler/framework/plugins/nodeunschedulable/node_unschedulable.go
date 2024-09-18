@@ -24,6 +24,7 @@ import (
 	v1helper "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	"k8s.io/kubernetes/pkg/scheduler/util"
 )
@@ -31,6 +32,7 @@ import (
 // NodeUnschedulable plugin filters nodes that set node.Spec.Unschedulable=true unless
 // the pod tolerates {key=node.kubernetes.io/unschedulable, effect:NoSchedule} taint.
 type NodeUnschedulable struct {
+	enableSchedulingQueueHint bool
 }
 
 var _ framework.FilterPlugin = &NodeUnschedulable{}
@@ -48,33 +50,31 @@ const (
 
 // EventsToRegister returns the possible events that may make a Pod
 // failed by this plugin schedulable.
-func (pl *NodeUnschedulable) EventsToRegister() []framework.ClusterEventWithHint {
+func (pl *NodeUnschedulable) EventsToRegister(_ context.Context) ([]framework.ClusterEventWithHint, error) {
+	// preCheck is not used when QHint is enabled.
 	return []framework.ClusterEventWithHint{
 		{Event: framework.ClusterEvent{Resource: framework.Node, ActionType: framework.Add | framework.UpdateNodeTaint}, QueueingHintFn: pl.isSchedulableAfterNodeChange},
-	}
+	}, nil
 }
 
 // isSchedulableAfterNodeChange is invoked for all node events reported by
 // an informer. It checks whether that change made a previously unschedulable
 // pod schedulable.
 func (pl *NodeUnschedulable) isSchedulableAfterNodeChange(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (framework.QueueingHint, error) {
-	originalNode, modifiedNode, err := util.As[*v1.Node](oldObj, newObj)
+	_, modifiedNode, err := util.As[*v1.Node](oldObj, newObj)
 	if err != nil {
-		logger.Error(err, "unexpected objects in isSchedulableAfterNodeChange", "oldObj", oldObj, "newObj", newObj)
 		return framework.Queue, err
 	}
 
-	originalNodeSchedulable, modifiedNodeSchedulable := false, !modifiedNode.Spec.Unschedulable
-	if originalNode != nil {
-		originalNodeSchedulable = !originalNode.Spec.Unschedulable
-	}
-
-	if !originalNodeSchedulable && modifiedNodeSchedulable {
-		logger.V(4).Info("node was created or updated, pod may be schedulable now", "pod", klog.KObj(pod), "node", klog.KObj(modifiedNode))
+	if !modifiedNode.Spec.Unschedulable {
+		logger.V(5).Info("node was created or updated, pod may be schedulable now", "pod", klog.KObj(pod), "node", klog.KObj(modifiedNode))
 		return framework.Queue, nil
 	}
 
-	logger.V(4).Info("node was created or updated, but it doesn't make this pod schedulable", "pod", klog.KObj(pod), "node", klog.KObj(modifiedNode))
+	// TODO: also check if the original node meets the pod's requestments once preCheck is completely removed.
+	// See: https://github.com/kubernetes/kubernetes/issues/110175
+
+	logger.V(5).Info("node was created or updated, but it doesn't make this pod schedulable", "pod", klog.KObj(pod), "node", klog.KObj(modifiedNode))
 	return framework.QueueSkip, nil
 }
 
@@ -104,6 +104,6 @@ func (pl *NodeUnschedulable) Filter(ctx context.Context, _ *framework.CycleState
 }
 
 // New initializes a new plugin and returns it.
-func New(_ context.Context, _ runtime.Object, _ framework.Handle) (framework.Plugin, error) {
-	return &NodeUnschedulable{}, nil
+func New(_ context.Context, _ runtime.Object, _ framework.Handle, fts feature.Features) (framework.Plugin, error) {
+	return &NodeUnschedulable{enableSchedulingQueueHint: fts.EnableSchedulingQueueHint}, nil
 }

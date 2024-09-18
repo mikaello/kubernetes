@@ -357,7 +357,7 @@ var _ = SIGDescribe("Garbage collector", func() {
 		}
 		ginkgo.By("wait for all pods to be garbage collected")
 		// wait for the RCs and Pods to reach the expected numbers.
-		if err := wait.PollWithContext(ctx, 5*time.Second, (60*time.Second)+gcInformerResyncRetryTimeout, func(ctx context.Context) (bool, error) {
+		if err := wait.PollUntilContextTimeout(ctx, 5*time.Second, (60*time.Second)+gcInformerResyncRetryTimeout, false, func(ctx context.Context) (bool, error) {
 			objects := map[string]int{"ReplicationControllers": 0, "Pods": 0}
 			return verifyRemainingObjects(ctx, f, objects)
 		}); err != nil {
@@ -406,7 +406,7 @@ var _ = SIGDescribe("Garbage collector", func() {
 		// actual qps is less than 5. Also, the e2e tests are running in
 		// parallel, the GC controller might get distracted by other tests.
 		// According to the test logs, 120s is enough time.
-		if err := wait.PollWithContext(ctx, 5*time.Second, 120*time.Second+gcInformerResyncRetryTimeout, func(ctx context.Context) (bool, error) {
+		if err := wait.PollUntilContextTimeout(ctx, 5*time.Second, 120*time.Second+gcInformerResyncRetryTimeout, false, func(ctx context.Context) (bool, error) {
 			rcs, err := rcClient.List(ctx, metav1.ListOptions{})
 			if err != nil {
 				return false, fmt.Errorf("failed to list rcs: %w", err)
@@ -663,7 +663,7 @@ var _ = SIGDescribe("Garbage collector", func() {
 		// owner deletion, but in practice there can be a long delay between owner
 		// deletion and dependent deletion processing. For now, increase the timeout
 		// and investigate the processing delay.
-		if err := wait.PollWithContext(ctx, 1*time.Second, 30*time.Second+gcInformerResyncRetryTimeout, func(ctx context.Context) (bool, error) {
+		if err := wait.PollUntilContextTimeout(ctx, 1*time.Second, 30*time.Second+gcInformerResyncRetryTimeout, false, func(ctx context.Context) (bool, error) {
 			_, err := rcClient.Get(ctx, rc.Name, metav1.GetOptions{})
 			if err == nil {
 				pods, _ := podClient.List(ctx, metav1.ListOptions{})
@@ -755,7 +755,7 @@ var _ = SIGDescribe("Garbage collector", func() {
 		ginkgo.By("wait for the rc to be deleted")
 		// TODO: shorten the timeout when we make GC's periodic API rediscovery more efficient.
 		// Tracked at https://github.com/kubernetes/kubernetes/issues/50046.
-		if err := wait.PollWithContext(ctx, 5*time.Second, 90*time.Second, func(ctx context.Context) (bool, error) {
+		if err := wait.PollUntilContextTimeout(ctx, 5*time.Second, 90*time.Second, false, func(ctx context.Context) (bool, error) {
 			_, err := rcClient.Get(ctx, rc1.Name, metav1.GetOptions{})
 			if err == nil {
 				pods, _ := podClient.List(ctx, metav1.ListOptions{})
@@ -855,7 +855,7 @@ var _ = SIGDescribe("Garbage collector", func() {
 		var err2 error
 		// TODO: shorten the timeout when we make GC's periodic API rediscovery more efficient.
 		// Tracked at https://github.com/kubernetes/kubernetes/issues/50046.
-		if err := wait.PollWithContext(ctx, 5*time.Second, 90*time.Second+gcInformerResyncRetryTimeout, func(ctx context.Context) (bool, error) {
+		if err := wait.PollUntilContextTimeout(ctx, 5*time.Second, 90*time.Second+gcInformerResyncRetryTimeout, false, func(ctx context.Context) (bool, error) {
 			pods, err2 = podClient.List(ctx, metav1.ListOptions{})
 			if err2 != nil {
 				return false, fmt.Errorf("failed to list pods: %w", err)
@@ -985,7 +985,7 @@ var _ = SIGDescribe("Garbage collector", func() {
 		// Ensure the dependent is deleted.
 		var lastDependent *unstructured.Unstructured
 		var err2 error
-		if err := wait.PollWithContext(ctx, 5*time.Second, 60*time.Second, func(ctx context.Context) (bool, error) {
+		if err := wait.PollUntilContextTimeout(ctx, 5*time.Second, 60*time.Second, false, func(ctx context.Context) (bool, error) {
 			lastDependent, err2 = resourceClient.Get(ctx, dependentName, metav1.GetOptions{})
 			return apierrors.IsNotFound(err2), nil
 		}); err != nil {
@@ -1088,7 +1088,7 @@ var _ = SIGDescribe("Garbage collector", func() {
 		}
 
 		ginkgo.By("wait for the owner to be deleted")
-		if err := wait.PollWithContext(ctx, 5*time.Second, 120*time.Second, func(ctx context.Context) (bool, error) {
+		if err := wait.PollUntilContextTimeout(ctx, 5*time.Second, 120*time.Second, false, func(ctx context.Context) (bool, error) {
 			_, err = resourceClient.Get(ctx, ownerName, metav1.GetOptions{})
 			if err == nil {
 				return false, nil
@@ -1101,14 +1101,11 @@ var _ = SIGDescribe("Garbage collector", func() {
 			framework.Failf("timeout in waiting for the owner to be deleted: %v", err)
 		}
 
-		// Wait 30s and ensure the dependent is not deleted.
-		ginkgo.By("wait for 30 seconds to see if the garbage collector mistakenly deletes the dependent crd")
-		if err := wait.PollWithContext(ctx, 5*time.Second, 30*time.Second+gcInformerResyncRetryTimeout, func(ctx context.Context) (bool, error) {
-			_, err := resourceClient.Get(ctx, dependentName, metav1.GetOptions{})
-			return false, err
-		}); err != nil && !wait.Interrupted(err) {
-			framework.Failf("failed to ensure the dependent is not deleted: %v", err)
-		}
+		timeout := 30*time.Second + gcInformerResyncRetryTimeout
+		ginkgo.By(fmt.Sprintf("wait for %s to see if the garbage collector mistakenly deletes the dependent crd\n", timeout))
+		gomega.Consistently(ctx, framework.HandleRetry(func(ctx context.Context) (*unstructured.Unstructured, error) {
+			return resourceClient.Get(ctx, dependentName, metav1.GetOptions{})
+		})).WithTimeout(timeout).WithPolling(5 * time.Second).ShouldNot(gomega.BeNil())
 	})
 
 	ginkgo.It("should delete jobs and pods created by cronjob", func(ctx context.Context) {
@@ -1153,7 +1150,7 @@ func waitForReplicas(ctx context.Context, rc *v1.ReplicationController, rcClient
 		lastObservedRC *v1.ReplicationController
 		err            error
 	)
-	if err := wait.PollWithContext(ctx, framework.Poll, replicaSyncTimeout, func(ctx context.Context) (bool, error) {
+	if err := wait.PollUntilContextTimeout(ctx, framework.Poll, replicaSyncTimeout, false, func(ctx context.Context) (bool, error) {
 		lastObservedRC, err = rcClient.Get(ctx, rc.Name, metav1.GetOptions{})
 		if err != nil {
 			return false, err

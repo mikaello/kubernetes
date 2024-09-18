@@ -31,18 +31,20 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	kubeletstatsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
-	"k8s.io/kubernetes/pkg/features"
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
 	"k8s.io/kubernetes/pkg/kubelet/eviction"
 	evictionapi "k8s.io/kubernetes/pkg/kubelet/eviction/api"
 	kubeletmetrics "k8s.io/kubernetes/pkg/kubelet/metrics"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
+	"k8s.io/kubernetes/test/e2e/nodefeature"
 	testutils "k8s.io/kubernetes/test/utils"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 	admissionapi "k8s.io/pod-security-admission/api"
+	"k8s.io/utils/ptr"
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
@@ -69,7 +71,7 @@ const (
 
 // InodeEviction tests that the node responds to node disk pressure by evicting only responsible pods.
 // Node disk pressure is induced by consuming all inodes on the node.
-var _ = SIGDescribe("InodeEviction [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
+var _ = SIGDescribe("InodeEviction", framework.WithSlow(), framework.WithSerial(), framework.WithDisruptive(), nodefeature.Eviction, func() {
 	f := framework.NewDefaultFramework("inode-eviction-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 	expectedNodeCondition := v1.NodeDiskPressure
@@ -106,7 +108,7 @@ var _ = SIGDescribe("InodeEviction [Slow] [Serial] [Disruptive][NodeFeature:Evic
 
 // ImageGCNoEviction tests that the node does not evict pods when inodes are consumed by images
 // Disk pressure is induced by pulling large images
-var _ = SIGDescribe("ImageGCNoEviction [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
+var _ = SIGDescribe("ImageGCNoEviction", framework.WithSlow(), framework.WithSerial(), framework.WithDisruptive(), nodefeature.Eviction, func() {
 	f := framework.NewDefaultFramework("image-gc-eviction-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 	pressureTimeout := 10 * time.Minute
@@ -137,7 +139,7 @@ var _ = SIGDescribe("ImageGCNoEviction [Slow] [Serial] [Disruptive][NodeFeature:
 
 // MemoryAllocatableEviction tests that the node responds to node memory pressure by evicting only responsible pods.
 // Node memory pressure is only encountered because we reserve the majority of the node's capacity via kube-reserved.
-var _ = SIGDescribe("MemoryAllocatableEviction [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
+var _ = SIGDescribe("MemoryAllocatableEviction", framework.WithSlow(), framework.WithSerial(), framework.WithDisruptive(), nodefeature.Eviction, func() {
 	f := framework.NewDefaultFramework("memory-allocatable-eviction-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 	expectedNodeCondition := v1.NodeMemoryPressure
@@ -171,7 +173,7 @@ var _ = SIGDescribe("MemoryAllocatableEviction [Slow] [Serial] [Disruptive][Node
 
 // LocalStorageEviction tests that the node responds to node disk pressure by evicting only responsible pods
 // Disk pressure is induced by running pods which consume disk space.
-var _ = SIGDescribe("LocalStorageEviction [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
+var _ = SIGDescribe("LocalStorageEviction", framework.WithSlow(), framework.WithSerial(), framework.WithDisruptive(), nodefeature.Eviction, func() {
 	f := framework.NewDefaultFramework("localstorage-eviction-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 	pressureTimeout := 15 * time.Minute
@@ -210,7 +212,7 @@ var _ = SIGDescribe("LocalStorageEviction [Slow] [Serial] [Disruptive][NodeFeatu
 // LocalStorageEviction tests that the node responds to node disk pressure by evicting only responsible pods
 // Disk pressure is induced by running pods which consume disk space, which exceed the soft eviction threshold.
 // Note: This test's purpose is to test Soft Evictions.  Local storage was chosen since it is the least costly to run.
-var _ = SIGDescribe("LocalStorageSoftEviction [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
+var _ = SIGDescribe("LocalStorageSoftEviction", framework.WithSlow(), framework.WithSerial(), framework.WithDisruptive(), nodefeature.Eviction, func() {
 	f := framework.NewDefaultFramework("localstorage-eviction-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 	pressureTimeout := 10 * time.Minute
@@ -249,7 +251,7 @@ var _ = SIGDescribe("LocalStorageSoftEviction [Slow] [Serial] [Disruptive][NodeF
 // This test validates that in-memory EmptyDir's are evicted when the Kubelet does
 // not have Sized Memory Volumes enabled. When Sized volumes are enabled, it's
 // not possible to exhaust the quota.
-var _ = SIGDescribe("LocalStorageCapacityIsolationMemoryBackedVolumeEviction [Slow] [Serial] [Disruptive] [Feature:LocalStorageCapacityIsolation][NodeFeature:Eviction]", func() {
+var _ = SIGDescribe("LocalStorageCapacityIsolationMemoryBackedVolumeEviction", framework.WithSlow(), framework.WithSerial(), framework.WithDisruptive(), feature.LocalStorageCapacityIsolation, nodefeature.Eviction, func() {
 	f := framework.NewDefaultFramework("localstorage-eviction-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 	evictionTestTimeout := 7 * time.Minute
@@ -292,7 +294,7 @@ var _ = SIGDescribe("LocalStorageCapacityIsolationMemoryBackedVolumeEviction [Sl
 })
 
 // LocalStorageCapacityIsolationEviction tests that container and volume local storage limits are enforced through evictions
-var _ = SIGDescribe("LocalStorageCapacityIsolationEviction [Slow] [Serial] [Disruptive] [Feature:LocalStorageCapacityIsolation][NodeFeature:Eviction]", func() {
+var _ = SIGDescribe("LocalStorageCapacityIsolationEviction", framework.WithSlow(), framework.WithSerial(), framework.WithDisruptive(), feature.LocalStorageCapacityIsolation, nodefeature.Eviction, func() {
 	f := framework.NewDefaultFramework("localstorage-eviction-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 	evictionTestTimeout := 10 * time.Minute
@@ -345,7 +347,7 @@ var _ = SIGDescribe("LocalStorageCapacityIsolationEviction [Slow] [Serial] [Disr
 // PriorityMemoryEvictionOrdering tests that the node responds to node memory pressure by evicting pods.
 // This test tests that the guaranteed pod is never evicted, and that the lower-priority pod is evicted before
 // the higher priority pod.
-var _ = SIGDescribe("PriorityMemoryEvictionOrdering [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
+var _ = SIGDescribe("PriorityMemoryEvictionOrdering", framework.WithSlow(), framework.WithSerial(), framework.WithDisruptive(), nodefeature.Eviction, func() {
 	f := framework.NewDefaultFramework("priority-memory-eviction-ordering-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 	expectedNodeCondition := v1.NodeMemoryPressure
@@ -405,7 +407,7 @@ var _ = SIGDescribe("PriorityMemoryEvictionOrdering [Slow] [Serial] [Disruptive]
 // PriorityLocalStorageEvictionOrdering tests that the node responds to node disk pressure by evicting pods.
 // This test tests that the guaranteed pod is never evicted, and that the lower-priority pod is evicted before
 // the higher priority pod.
-var _ = SIGDescribe("PriorityLocalStorageEvictionOrdering [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
+var _ = SIGDescribe("PriorityLocalStorageEvictionOrdering", framework.WithSlow(), framework.WithSerial(), framework.WithDisruptive(), nodefeature.Eviction, func() {
 	f := framework.NewDefaultFramework("priority-disk-eviction-ordering-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 	expectedNodeCondition := v1.NodeDiskPressure
@@ -464,7 +466,7 @@ var _ = SIGDescribe("PriorityLocalStorageEvictionOrdering [Slow] [Serial] [Disru
 })
 
 // PriorityPidEvictionOrdering tests that the node emits pid pressure in response to a fork bomb, and evicts pods by priority
-var _ = SIGDescribe("PriorityPidEvictionOrdering [Slow] [Serial] [Disruptive][NodeFeature:Eviction]", func() {
+var _ = SIGDescribe("PriorityPidEvictionOrdering", framework.WithSlow(), framework.WithSerial(), framework.WithDisruptive(), nodefeature.Eviction, func() {
 	f := framework.NewDefaultFramework("pidpressure-eviction-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 	pressureTimeout := 10 * time.Minute
@@ -473,6 +475,7 @@ var _ = SIGDescribe("PriorityPidEvictionOrdering [Slow] [Serial] [Disruptive][No
 
 	highPriorityClassName := f.BaseName + "-high-priority"
 	highPriority := int32(999999999)
+	processes := 30000
 
 	ginkgo.Context(fmt.Sprintf(testContextFmt, expectedNodeCondition), func() {
 		tempSetCurrentKubeletConfig(f, func(ctx context.Context, initialConfig *kubeletconfig.KubeletConfiguration) {
@@ -495,7 +498,7 @@ var _ = SIGDescribe("PriorityPidEvictionOrdering [Slow] [Serial] [Disruptive][No
 		specs := []podEvictSpec{
 			{
 				evictionPriority: 2,
-				pod:              pidConsumingPod("fork-bomb-container-with-low-priority", 12000),
+				pod:              pidConsumingPod("fork-bomb-container-with-low-priority", processes),
 			},
 			{
 				evictionPriority: 0,
@@ -503,7 +506,7 @@ var _ = SIGDescribe("PriorityPidEvictionOrdering [Slow] [Serial] [Disruptive][No
 			},
 			{
 				evictionPriority: 1,
-				pod:              pidConsumingPod("fork-bomb-container-with-high-priority", 12000),
+				pod:              pidConsumingPod("fork-bomb-container-with-high-priority", processes),
 			},
 		}
 		specs[1].pod.Spec.PriorityClassName = highPriorityClassName
@@ -511,23 +514,19 @@ var _ = SIGDescribe("PriorityPidEvictionOrdering [Slow] [Serial] [Disruptive][No
 		runEvictionTest(f, pressureTimeout, expectedNodeCondition, expectedStarvedResource, logPidMetrics, specs)
 	})
 
-	ginkgo.Context(fmt.Sprintf(testContextFmt, expectedNodeCondition)+"; PodDisruptionConditions enabled [NodeFeature:PodDisruptionConditions]", func() {
+	f.Context(fmt.Sprintf(testContextFmt, expectedNodeCondition)+"; baseline scenario to verify DisruptionTarget is added", func() {
 		tempSetCurrentKubeletConfig(f, func(ctx context.Context, initialConfig *kubeletconfig.KubeletConfiguration) {
 			pidsConsumed := int64(10000)
 			summary := eventuallyGetSummary(ctx)
 			availablePids := *(summary.Node.Rlimit.MaxPID) - *(summary.Node.Rlimit.NumOfRunningProcesses)
 			initialConfig.EvictionHard = map[string]string{string(evictionapi.SignalPIDAvailable): fmt.Sprintf("%d", availablePids-pidsConsumed)}
 			initialConfig.EvictionMinimumReclaim = map[string]string{}
-			initialConfig.FeatureGates = map[string]bool{
-				string(features.PodDisruptionConditions): true,
-			}
 		})
-		disruptionTarget := v1.DisruptionTarget
 		specs := []podEvictSpec{
 			{
 				evictionPriority:           1,
-				pod:                        pidConsumingPod("fork-bomb-container", 30000),
-				wantPodDisruptionCondition: &disruptionTarget,
+				pod:                        pidConsumingPod("fork-bomb-container", processes),
+				wantPodDisruptionCondition: ptr.To(v1.DisruptionTarget),
 			},
 		}
 		runEvictionTest(f, pressureTimeout, expectedNodeCondition, expectedStarvedResource, logPidMetrics, specs)
@@ -968,6 +967,19 @@ func innocentPod() *v1.Pod {
 						"-c",
 						"while true; do sleep 5; done",
 					},
+					Resources: v1.ResourceRequirements{
+						// These values are set so that we don't consider this pod to be over the limits
+						// If the requests are not set, then we assume a request limit of 0 so it is always over.
+						// This fixes this for the innocent pod.
+						Requests: v1.ResourceList{
+							v1.ResourceEphemeralStorage: resource.MustParse("50Mi"),
+							v1.ResourceMemory:           resource.MustParse("50Mi"),
+						},
+						Limits: v1.ResourceList{
+							v1.ResourceEphemeralStorage: resource.MustParse("50Mi"),
+							v1.ResourceMemory:           resource.MustParse("50Mi"),
+						},
+					},
 				},
 			},
 		},
@@ -1075,13 +1087,13 @@ func getMemhogPod(podName string, ctnName string, res v1.ResourceRequirements) *
 			Containers: []v1.Container{
 				{
 					Name:            ctnName,
-					Image:           "registry.k8s.io/stress:v1",
+					Image:           imageutils.GetE2EImage(imageutils.Agnhost),
 					ImagePullPolicy: "Always",
 					Env:             env,
 					// 60 min timeout * 60s / tick per 10s = 360 ticks before timeout => ~11.11Mi/tick
 					// to fill ~4Gi of memory, so initial ballpark 12Mi/tick.
 					// We might see flakes due to timeout if the total memory on the nodes increases.
-					Args:      []string{"-mem-alloc-size", "12Mi", "-mem-alloc-sleep", "10s", "-mem-total", memLimit},
+					Args:      []string{"stress", "--mem-alloc-size", "12Mi", "--mem-alloc-sleep", "10s", "--mem-total", memLimit},
 					Resources: res,
 				},
 			},

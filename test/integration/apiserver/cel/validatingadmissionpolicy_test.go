@@ -30,6 +30,7 @@ import (
 	"text/template"
 	"time"
 
+	authenticationv1 "k8s.io/api/authentication/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextensionsclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/apiextensions-apiserver/test/integration/fixtures"
@@ -39,6 +40,7 @@ import (
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/rest"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/utils/ptr"
 
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
 	apiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
@@ -55,50 +57,169 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apiserver/pkg/admission/plugin/policy/generic"
 	"k8s.io/client-go/dynamic"
 	clientset "k8s.io/client-go/kubernetes"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
-	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	v1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 )
 
-// Test_ValidateNamespace_NoParams tests a ValidatingAdmissionPolicy that validates creation of a Namespace with no params.
-func Test_ValidateNamespace_NoParams(t *testing.T) {
+// Short term fix to refresh the policy source cache faster for tests
+// until we reduce the polling interval by default.
+const policyRefreshInterval = 10 * time.Millisecond
+
+// Test_ValidateNamespace_NoParams_Success tests a ValidatingAdmissionPolicy that validates creation of a Namespace
+// with no params via happy path.
+func Test_ValidateNamespace_NoParams_Success(t *testing.T) {
+	resetPolicyRefreshInterval := generic.SetPolicyRefreshIntervalForTests(policyRefreshInterval)
+	defer resetPolicyRefreshInterval()
+	server, err := apiservertesting.StartTestServer(t, nil, []string{
+		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
+	}, framework.SharedEtcd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.TearDownFn()
+
+	config := server.ClientConfig
+	client, err := clientset.NewForConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testcases := []struct {
+		name          string
+		policy        *admissionregistrationv1.ValidatingAdmissionPolicy
+		policyBinding *admissionregistrationv1.ValidatingAdmissionPolicyBinding
+	}{
+		{
+			name: "namespace name contains suffix enforced by validating admission policy, using object metadata fields",
+			policy: withValidations([]admissionregistrationv1.Validation{
+				{
+					Expression: "object.metadata.name.endsWith('k8s')",
+				},
+			}, withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
+			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
+		},
+		{
+			name: "namespace name contains suffix enforced by validating admission policy, using request field",
+			policy: withValidations([]admissionregistrationv1.Validation{
+				{
+					Expression: "request.name.endsWith('k8s')",
+				},
+			}, withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
+			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
+		},
+		{
+			name: "namespace name does NOT contains suffix enforced by validating admission policy, using request field",
+			policy: withValidations([]admissionregistrationv1.Validation{
+				{
+					Expression: "request.name.endsWith('k8s')",
+				},
+			}, withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
+			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
+		},
+		{
+			name: "runtime error when validating namespace, but failurePolicy=Ignore",
+			policy: withValidations([]admissionregistrationv1.Validation{
+				{
+					Expression: "object.nonExistentProperty == 'someval'",
+				},
+			}, withFailurePolicy(admissionregistrationv1.Ignore, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
+			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
+		},
+		{
+			name: "with check against unguarded params using has() and default check",
+			policy: withValidations([]admissionregistrationv1.Validation{
+				{
+					Expression: "(has(params.metadata) && has(params.metadata.name) && object.metadata.name.startsWith(params.metadata.name)) || object.metadata.name.endsWith('k8s')",
+				},
+			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix"))))),
+			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
+		},
+		{
+			name: "with check against null params and default check",
+			policy: withValidations([]admissionregistrationv1.Validation{
+				{
+					Expression: "(params != null && object.metadata.name.startsWith(params.metadata.name)) || object.metadata.name.endsWith('k8s')",
+				},
+			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix"))))),
+			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
+		},
+		{
+			name: "with check against namespaceObject",
+			policy: withValidations([]admissionregistrationv1.Validation{
+				{
+					Expression: "namespaceObject == null", // because namespace itself is cluster-scoped.
+				},
+			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix"))))),
+			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
+		},
+	}
+	for i, testcase := range testcases {
+		t.Run(testcase.name, func(t *testing.T) {
+			policy := withWaitReadyConstraintAndExpression(testcase.policy)
+			if _, err := client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := createAndWaitReady(t, client, testcase.policyBinding, nil); err != nil {
+				t.Fatal(err)
+			}
+
+			nsName := fmt.Sprintf("test-%d-k8s", i)
+			ns := &v1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: nsName,
+				},
+			}
+			_, err = client.CoreV1().Namespaces().Create(context.TODO(), ns, metav1.CreateOptions{})
+
+			checkExpectedError(t, err, "")
+			checkFailureReason(t, err, "")
+			if err := cleanupPolicy(t, client, policy, testcase.policyBinding); err != nil {
+				t.Errorf("error while cleaning up policy and its bindings: %v", err)
+			}
+		})
+	}
+}
+
+// Test_ValidateNamespace_NoParams_Failures tests a ValidatingAdmissionPolicy that fails creation of a Namespace with no params.
+func Test_ValidateNamespace_NoParams_Failures(t *testing.T) {
+	resetPolicyRefreshInterval := generic.SetPolicyRefreshIntervalForTests(policyRefreshInterval)
+	defer resetPolicyRefreshInterval()
+	server, err := apiservertesting.StartTestServer(t, nil, []string{
+		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
+	}, framework.SharedEtcd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.TearDownFn()
+
+	config := server.ClientConfig
+	client, err := clientset.NewForConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
 	forbiddenReason := metav1.StatusReasonForbidden
 
 	testcases := []struct {
 		name          string
-		policy        *admissionregistrationv1beta1.ValidatingAdmissionPolicy
-		policyBinding *admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding
+		policy        *admissionregistrationv1.ValidatingAdmissionPolicy
+		policyBinding *admissionregistrationv1.ValidatingAdmissionPolicyBinding
 		namespace     *v1.Namespace
 		err           string
 		failureReason metav1.StatusReason
 	}{
 		{
-			name: "namespace name contains suffix enforced by validating admission policy, using object metadata fields",
-			policy: withValidations([]admissionregistrationv1beta1.Validation{
-				{
-					Expression: "object.metadata.name.endsWith('k8s')",
-				},
-			}, withFailurePolicy(admissionregistrationv1beta1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
-			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
-			namespace: &v1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-k8s",
-				},
-			},
-			err: "",
-		},
-		{
 			name: "namespace name does NOT contain suffix enforced by validating admission policyusing, object metadata fields",
-			policy: withValidations([]admissionregistrationv1beta1.Validation{
+			policy: withValidations([]admissionregistrationv1.Validation{
 				{
 					Expression: "object.metadata.name.endsWith('k8s')",
 				},
-			}, withFailurePolicy(admissionregistrationv1beta1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
+			}, withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
 			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
 			namespace: &v1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
@@ -110,12 +231,12 @@ func Test_ValidateNamespace_NoParams(t *testing.T) {
 		},
 		{
 			name: "namespace name does NOT contain suffix enforced by validating admission policy using object metadata fields, AND validating expression returns StatusReasonForbidden",
-			policy: withValidations([]admissionregistrationv1beta1.Validation{
+			policy: withValidations([]admissionregistrationv1.Validation{
 				{
 					Expression: "object.metadata.name.endsWith('k8s')",
 					Reason:     &forbiddenReason,
 				},
-			}, withFailurePolicy(admissionregistrationv1beta1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
+			}, withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
 			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
 			namespace: &v1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
@@ -126,57 +247,12 @@ func Test_ValidateNamespace_NoParams(t *testing.T) {
 			failureReason: metav1.StatusReasonForbidden,
 		},
 		{
-			name: "namespace name contains suffix enforced by validating admission policy, using request field",
-			policy: withValidations([]admissionregistrationv1beta1.Validation{
-				{
-					Expression: "request.name.endsWith('k8s')",
-				},
-			}, withFailurePolicy(admissionregistrationv1beta1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
-			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
-			namespace: &v1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-k8s",
-				},
-			},
-			err: "",
-		},
-		{
-			name: "namespace name does NOT contains suffix enforced by validating admission policy, using request field",
-			policy: withValidations([]admissionregistrationv1beta1.Validation{
-				{
-					Expression: "request.name.endsWith('k8s')",
-				},
-			}, withFailurePolicy(admissionregistrationv1beta1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
-			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
-			namespace: &v1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-k8s",
-				},
-			},
-			err: "",
-		},
-		{
-			name: "runtime error when validating namespace, but failurePolicy=Ignore",
-			policy: withValidations([]admissionregistrationv1beta1.Validation{
-				{
-					Expression: "object.nonExistentProperty == 'someval'",
-				},
-			}, withFailurePolicy(admissionregistrationv1beta1.Ignore, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
-			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
-			namespace: &v1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-k8s",
-				},
-			},
-			err: "",
-		},
-		{
 			name: "runtime error when validating namespace, but failurePolicy=Fail",
-			policy: withValidations([]admissionregistrationv1beta1.Validation{
+			policy: withValidations([]admissionregistrationv1.Validation{
 				{
 					Expression: "object.nonExistentProperty == 'someval'",
 				},
-			}, withFailurePolicy(admissionregistrationv1beta1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
+			}, withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
 			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
 			namespace: &v1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
@@ -188,11 +264,11 @@ func Test_ValidateNamespace_NoParams(t *testing.T) {
 		},
 		{
 			name: "runtime error due to unguarded params",
-			policy: withValidations([]admissionregistrationv1beta1.Validation{
+			policy: withValidations([]admissionregistrationv1.Validation{
 				{
 					Expression: "object.metadata.name.startsWith(params.metadata.name)",
 				},
-			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1beta1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix"))))),
+			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix"))))),
 			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
 			namespace: &v1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
@@ -204,11 +280,11 @@ func Test_ValidateNamespace_NoParams(t *testing.T) {
 		},
 		{
 			name: "with check against unguarded params using has()",
-			policy: withValidations([]admissionregistrationv1beta1.Validation{
+			policy: withValidations([]admissionregistrationv1.Validation{
 				{
 					Expression: "has(params.metadata) && has(params.metadata.name) && object.metadata.name.endsWith(params.metadata.name)",
 				},
-			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1beta1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix"))))),
+			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix"))))),
 			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
 			namespace: &v1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
@@ -220,11 +296,11 @@ func Test_ValidateNamespace_NoParams(t *testing.T) {
 		},
 		{
 			name: "with check against null params",
-			policy: withValidations([]admissionregistrationv1beta1.Validation{
+			policy: withValidations([]admissionregistrationv1.Validation{
 				{
 					Expression: "(params != null && object.metadata.name.endsWith(params.metadata.name))",
 				},
-			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1beta1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix"))))),
+			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix"))))),
 			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
 			namespace: &v1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
@@ -234,72 +310,11 @@ func Test_ValidateNamespace_NoParams(t *testing.T) {
 			err:           "namespaces \"test-k8s\" is forbidden: ValidatingAdmissionPolicy 'validate-namespace-suffix' with binding 'validate-namespace-suffix-binding' denied request: failed expression: (params != null && object.metadata.name.endsWith(params.metadata.name))",
 			failureReason: metav1.StatusReasonInvalid,
 		},
-		{
-			name: "with check against unguarded params using has() and default check",
-			policy: withValidations([]admissionregistrationv1beta1.Validation{
-				{
-					Expression: "(has(params.metadata) && has(params.metadata.name) && object.metadata.name.startsWith(params.metadata.name)) || object.metadata.name.endsWith('k8s')",
-				},
-			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1beta1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix"))))),
-			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
-			namespace: &v1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-k8s",
-				},
-			},
-			err: "",
-		},
-		{
-			name: "with check against null params and default check",
-			policy: withValidations([]admissionregistrationv1beta1.Validation{
-				{
-					Expression: "(params != null && object.metadata.name.startsWith(params.metadata.name)) || object.metadata.name.endsWith('k8s')",
-				},
-			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1beta1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix"))))),
-			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
-			namespace: &v1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-k8s",
-				},
-			},
-			err: "",
-		},
-		{
-			name: "with check against namespaceObject",
-			policy: withValidations([]admissionregistrationv1beta1.Validation{
-				{
-					Expression: "namespaceObject == null", // because namespace itself is cluster-scoped.
-				},
-			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1beta1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix"))))),
-			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", ""),
-			namespace: &v1.Namespace{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-k8s",
-				},
-			},
-			err: "",
-		},
 	}
 	for _, testcase := range testcases {
 		t.Run(testcase.name, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
-
-			server, err := apiservertesting.StartTestServer(t, nil, []string{
-				"--enable-admission-plugins", "ValidatingAdmissionPolicy",
-			}, framework.SharedEtcd())
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer server.TearDownFn()
-
-			config := server.ClientConfig
-
-			client, err := clientset.NewForConfig(config)
-			if err != nil {
-				t.Fatal(err)
-			}
 			policy := withWaitReadyConstraintAndExpression(testcase.policy)
-			if _, err := client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
+			if _, err := client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
 				t.Fatal(err)
 			}
 			if err := createAndWaitReady(t, client, testcase.policyBinding, nil); err != nil {
@@ -310,14 +325,18 @@ func Test_ValidateNamespace_NoParams(t *testing.T) {
 
 			checkExpectedError(t, err, testcase.err)
 			checkFailureReason(t, err, testcase.failureReason)
+			if err := cleanupPolicy(t, client, policy, testcase.policyBinding); err != nil {
+				t.Errorf("error while cleaning up policy and its bindings: %v", err)
+			}
 		})
 	}
 }
+
 func Test_ValidateAnnotationsAndWarnings(t *testing.T) {
 	testcases := []struct {
 		name             string
-		policy           *admissionregistrationv1beta1.ValidatingAdmissionPolicy
-		policyBinding    *admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding
+		policy           *admissionregistrationv1.ValidatingAdmissionPolicy
+		policyBinding    *admissionregistrationv1.ValidatingAdmissionPolicyBinding
 		object           *v1.ConfigMap
 		err              string
 		failureReason    metav1.StatusReason
@@ -326,7 +345,7 @@ func Test_ValidateAnnotationsAndWarnings(t *testing.T) {
 	}{
 		{
 			name: "with audit annotations",
-			policy: withAuditAnnotations([]admissionregistrationv1beta1.AuditAnnotation{
+			policy: withAuditAnnotations([]admissionregistrationv1.AuditAnnotation{
 				{
 					Key:             "example-key",
 					ValueExpression: "'object name: ' + object.metadata.name",
@@ -335,7 +354,7 @@ func Test_ValidateAnnotationsAndWarnings(t *testing.T) {
 					Key:             "exclude-key",
 					ValueExpression: "null",
 				},
-			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1beta1.Fail, withConfigMapMatch(makePolicy("validate-audit-annotations"))))),
+			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1.Fail, withConfigMapMatch(makePolicy("validate-audit-annotations"))))),
 			policyBinding: makeBinding("validate-audit-annotations-binding", "validate-audit-annotations", ""),
 			object: &v1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
@@ -349,12 +368,12 @@ func Test_ValidateAnnotationsAndWarnings(t *testing.T) {
 		},
 		{
 			name: "with audit annotations with invalid expression",
-			policy: withAuditAnnotations([]admissionregistrationv1beta1.AuditAnnotation{
+			policy: withAuditAnnotations([]admissionregistrationv1.AuditAnnotation{
 				{
 					Key:             "example-key",
 					ValueExpression: "string(params.metadata.name)", // runtime error, params is null
 				},
-			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1beta1.Fail, withConfigMapMatch(makePolicy("validate-audit-annotations-invalid"))))),
+			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1.Fail, withConfigMapMatch(makePolicy("validate-audit-annotations-invalid"))))),
 			policyBinding: makeBinding("validate-audit-annotations-invalid-binding", "validate-audit-annotations-invalid", ""),
 			object: &v1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
@@ -366,12 +385,12 @@ func Test_ValidateAnnotationsAndWarnings(t *testing.T) {
 		},
 		{
 			name: "with audit annotations with invalid expression and ignore failure policy",
-			policy: withAuditAnnotations([]admissionregistrationv1beta1.AuditAnnotation{
+			policy: withAuditAnnotations([]admissionregistrationv1.AuditAnnotation{
 				{
 					Key:             "example-key",
 					ValueExpression: "string(params.metadata.name)", // runtime error, params is null
 				},
-			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1beta1.Ignore, withConfigMapMatch(makePolicy("validate-audit-annotations-invalid-ignore"))))),
+			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1.Ignore, withConfigMapMatch(makePolicy("validate-audit-annotations-invalid-ignore"))))),
 			policyBinding: makeBinding("validate-audit-annotations-invalid-ignore-binding", "validate-audit-annotations-invalid-ignore", ""),
 			object: &v1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
@@ -382,12 +401,12 @@ func Test_ValidateAnnotationsAndWarnings(t *testing.T) {
 		},
 		{
 			name: "with warn validationActions",
-			policy: withValidations([]admissionregistrationv1beta1.Validation{
+			policy: withValidations([]admissionregistrationv1.Validation{
 				{
 					Expression: "object.metadata.name.endsWith('k8s')",
 				},
-			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1beta1.Fail, withConfigMapMatch(makePolicy("validate-actions-warn"))))),
-			policyBinding: withValidationActions([]admissionregistrationv1beta1.ValidationAction{admissionregistrationv1beta1.Warn}, makeBinding("validate-actions-warn-binding", "validate-actions-warn", "")),
+			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1.Fail, withConfigMapMatch(makePolicy("validate-actions-warn"))))),
+			policyBinding: withValidationActions([]admissionregistrationv1.ValidationAction{admissionregistrationv1.Warn}, makeBinding("validate-actions-warn-binding", "validate-actions-warn", "")),
 			object: &v1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "test4-nope",
@@ -397,12 +416,12 @@ func Test_ValidateAnnotationsAndWarnings(t *testing.T) {
 		},
 		{
 			name: "with audit validationActions",
-			policy: withValidations([]admissionregistrationv1beta1.Validation{
+			policy: withValidations([]admissionregistrationv1.Validation{
 				{
 					Expression: "object.metadata.name.endsWith('k8s')",
 				},
-			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1beta1.Fail, withConfigMapMatch(makePolicy("validate-actions-audit"))))),
-			policyBinding: withValidationActions([]admissionregistrationv1beta1.ValidationAction{admissionregistrationv1beta1.Deny, admissionregistrationv1beta1.Audit}, makeBinding("validate-actions-audit-binding", "validate-actions-audit", "")),
+			}, withParams(configParamKind(), withFailurePolicy(admissionregistrationv1.Fail, withConfigMapMatch(makePolicy("validate-actions-audit"))))),
+			policyBinding: withValidationActions([]admissionregistrationv1.ValidationAction{admissionregistrationv1.Deny, admissionregistrationv1.Audit}, makeBinding("validate-actions-audit-binding", "validate-actions-audit", "")),
 			object: &v1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "test5-nope",
@@ -415,8 +434,6 @@ func Test_ValidateAnnotationsAndWarnings(t *testing.T) {
 			},
 		},
 	}
-
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
 
 	// prepare audit policy file
 	policyFile, err := os.CreateTemp("", "audit-policy.yaml")
@@ -469,7 +486,7 @@ func Test_ValidateAnnotationsAndWarnings(t *testing.T) {
 			}
 
 			policy := withWaitReadyConstraintAndExpression(testcase.policy)
-			if _, err := client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
+			if _, err := client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
 				t.Fatal(err)
 			}
 
@@ -501,26 +518,52 @@ func Test_ValidateAnnotationsAndWarnings(t *testing.T) {
 // Test_ValidateNamespace_WithConfigMapParams tests a ValidatingAdmissionPolicy that validates creation of a Namespace,
 // using ConfigMap as a param reference.
 func Test_ValidateNamespace_WithConfigMapParams(t *testing.T) {
+	resetPolicyRefreshInterval := generic.SetPolicyRefreshIntervalForTests(policyRefreshInterval)
+	defer resetPolicyRefreshInterval()
+	server, err := apiservertesting.StartTestServer(t, nil, []string{
+		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
+	}, framework.SharedEtcd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.TearDownFn()
+
+	config := server.ClientConfig
+	client, err := clientset.NewForConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	policyBinding := makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", "validate-namespace-suffix-param")
+	configMap := makeConfigParams("validate-namespace-suffix-param", map[string]string{
+		"namespaceSuffix": "k8s",
+	})
+	if _, err := client.CoreV1().ConfigMaps("default").Create(context.TODO(), configMap, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	valPolicy := withValidations([]admissionregistrationv1.Validation{
+		{
+			Expression: "object.metadata.name.endsWith(params.data.namespaceSuffix)",
+		},
+	}, withFailurePolicy(admissionregistrationv1.Fail, withParams(configParamKind(), withNamespaceMatch(makePolicy("validate-namespace-suffix")))))
+	policy := withWaitReadyConstraintAndExpression(valPolicy)
+	if _, err := client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := createAndWaitReady(t, client, policyBinding, nil); err != nil {
+		t.Fatal(err)
+	}
+
 	testcases := []struct {
 		name          string
-		policy        *admissionregistrationv1beta1.ValidatingAdmissionPolicy
-		policyBinding *admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding
-		configMap     *v1.ConfigMap
 		namespace     *v1.Namespace
 		err           string
 		failureReason metav1.StatusReason
 	}{
 		{
 			name: "namespace name contains suffix enforced by validating admission policy",
-			policy: withValidations([]admissionregistrationv1beta1.Validation{
-				{
-					Expression: "object.metadata.name.endsWith(params.data.namespaceSuffix)",
-				},
-			}, withFailurePolicy(admissionregistrationv1beta1.Fail, withParams(configParamKind(), withNamespaceMatch(makePolicy("validate-namespace-suffix"))))),
-			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", "validate-namespace-suffix-param"),
-			configMap: makeConfigParams("validate-namespace-suffix-param", map[string]string{
-				"namespaceSuffix": "k8s",
-			}),
 			namespace: &v1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "test-k8s",
@@ -530,15 +573,6 @@ func Test_ValidateNamespace_WithConfigMapParams(t *testing.T) {
 		},
 		{
 			name: "namespace name does NOT contain suffix enforced by validating admission policy",
-			policy: withValidations([]admissionregistrationv1beta1.Validation{
-				{
-					Expression: "object.metadata.name.endsWith(params.data.namespaceSuffix)",
-				},
-			}, withFailurePolicy(admissionregistrationv1beta1.Fail, withParams(configParamKind(), withNamespaceMatch(makePolicy("validate-namespace-suffix"))))),
-			policyBinding: makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", "validate-namespace-suffix-param"),
-			configMap: makeConfigParams("validate-namespace-suffix-param", map[string]string{
-				"namespaceSuffix": "k8s",
-			}),
 			namespace: &v1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "test-foo",
@@ -548,39 +582,9 @@ func Test_ValidateNamespace_WithConfigMapParams(t *testing.T) {
 			failureReason: metav1.StatusReasonInvalid,
 		},
 	}
-
 	for _, testcase := range testcases {
 		t.Run(testcase.name, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
-			server, err := apiservertesting.StartTestServer(t, nil, []string{
-				"--enable-admission-plugins", "ValidatingAdmissionPolicy",
-			}, framework.SharedEtcd())
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer server.TearDownFn()
-
-			config := server.ClientConfig
-
-			client, err := clientset.NewForConfig(config)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			if _, err := client.CoreV1().ConfigMaps("default").Create(context.TODO(), testcase.configMap, metav1.CreateOptions{}); err != nil {
-				t.Fatal(err)
-			}
-
-			policy := withWaitReadyConstraintAndExpression(testcase.policy)
-			if _, err := client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
-				t.Fatal(err)
-			}
-			if err := createAndWaitReady(t, client, testcase.policyBinding, nil); err != nil {
-				t.Fatal(err)
-			}
-
 			_, err = client.CoreV1().Namespaces().Create(context.TODO(), testcase.namespace, metav1.CreateOptions{})
-
 			checkExpectedError(t, err, testcase.err)
 			checkFailureReason(t, err, testcase.failureReason)
 		})
@@ -588,7 +592,6 @@ func Test_ValidateNamespace_WithConfigMapParams(t *testing.T) {
 }
 
 func TestMultiplePolicyBindings(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
 	server, err := apiservertesting.StartTestServer(t, nil, nil, framework.SharedEtcd())
 	if err != nil {
 		t.Fatal(err)
@@ -602,18 +605,18 @@ func TestMultiplePolicyBindings(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	paramKind := &admissionregistrationv1beta1.ParamKind{
+	paramKind := &admissionregistrationv1.ParamKind{
 		APIVersion: "v1",
 		Kind:       "ConfigMap",
 	}
-	policy := withPolicyExistsLabels([]string{"paramIdent"}, withParams(paramKind, withPolicyMatch("secrets", withFailurePolicy(admissionregistrationv1beta1.Fail, makePolicy("test-policy")))))
-	policy.Spec.Validations = []admissionregistrationv1beta1.Validation{
+	policy := withPolicyExistsLabels([]string{"paramIdent"}, withParams(paramKind, withPolicyMatch("secrets", withFailurePolicy(admissionregistrationv1.Fail, makePolicy("test-policy")))))
+	policy.Spec.Validations = []admissionregistrationv1.Validation{
 		{
 			Expression: "params.data.autofail != 'true' && (params.data.conditional == 'false' || object.metadata.name.startsWith(params.data.check))",
 		},
 	}
 	policy = withWaitReadyConstraintAndExpression(policy)
-	if _, err := client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
+	if _, err := client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -715,7 +718,6 @@ func TestMultiplePolicyBindings(t *testing.T) {
 // Test_PolicyExemption tests that ValidatingAdmissionPolicy and ValidatingAdmissionPolicyBinding resources
 // are exempt from policy rules.
 func Test_PolicyExemption(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
 	server, err := apiservertesting.StartTestServer(t, nil, []string{
 		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
 	}, framework.SharedEtcd())
@@ -732,10 +734,10 @@ func Test_PolicyExemption(t *testing.T) {
 	}
 
 	policy := makePolicy("test-policy")
-	policy.Spec.MatchConstraints = &admissionregistrationv1beta1.MatchResources{
-		ResourceRules: []admissionregistrationv1beta1.NamedRuleWithOperations{
+	policy.Spec.MatchConstraints = &admissionregistrationv1.MatchResources{
+		ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{
 			{
-				RuleWithOperations: admissionregistrationv1beta1.RuleWithOperations{
+				RuleWithOperations: admissionregistrationv1.RuleWithOperations{
 					Operations: []admissionregistrationv1.OperationType{
 						"*",
 					},
@@ -755,12 +757,12 @@ func Test_PolicyExemption(t *testing.T) {
 		},
 	}
 
-	policy.Spec.Validations = []admissionregistrationv1beta1.Validation{{
+	policy.Spec.Validations = []admissionregistrationv1.Validation{{
 		Expression: "false",
 		Message:    "marker denied; policy is ready",
 	}}
 
-	policy, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
+	policy, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -771,18 +773,18 @@ func Test_PolicyExemption(t *testing.T) {
 	}
 
 	// validate that operations to ValidatingAdmissionPolicy are exempt from an existing policy that catches all resources
-	policy, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Get(context.TODO(), policy.Name, metav1.GetOptions{})
+	policy, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(context.TODO(), policy.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ignoreFailurePolicy := admissionregistrationv1beta1.Ignore
+	ignoreFailurePolicy := admissionregistrationv1.Ignore
 	policy.Spec.FailurePolicy = &ignoreFailurePolicy
-	_, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Update(context.TODO(), policy, metav1.UpdateOptions{})
+	_, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Update(context.TODO(), policy, metav1.UpdateOptions{})
 	if err != nil {
 		t.Error(err)
 	}
 
-	policyBinding, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicyBindings().Get(context.TODO(), policyBinding.Name, metav1.GetOptions{})
+	policyBinding, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicyBindings().Get(context.TODO(), policyBinding.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -790,7 +792,7 @@ func Test_PolicyExemption(t *testing.T) {
 	// validate that operations to ValidatingAdmissionPolicyBindings are exempt from an existing policy that catches all resources
 	policyBindingCopy := policyBinding.DeepCopy()
 	policyBindingCopy.Spec.PolicyName = "different-binding"
-	_, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicyBindings().Update(context.TODO(), policyBindingCopy, metav1.UpdateOptions{})
+	_, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicyBindings().Update(context.TODO(), policyBindingCopy, metav1.UpdateOptions{})
 	if err != nil {
 		t.Error(err)
 	}
@@ -802,7 +804,6 @@ func Test_PolicyExemption(t *testing.T) {
 // the new ParamKind to be allowed. For example, when Paramkind is v1/ConfigMap, only namespaces prefixed with "configmap"
 // is allowed and when ParamKind is updated to v1/Secret, only namespaces prefixed with "secret" is allowed, etc.
 func Test_ValidatingAdmissionPolicy_UpdateParamKind(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
 	server, err := apiservertesting.StartTestServer(t, nil, []string{
 		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
 	}, framework.SharedEtcd())
@@ -836,19 +837,19 @@ func Test_ValidatingAdmissionPolicy_UpdateParamKind(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	paramKind := &admissionregistrationv1beta1.ParamKind{
+	paramKind := &admissionregistrationv1.ParamKind{
 		APIVersion: "v1",
 		Kind:       "ConfigMap",
 	}
 
-	policy := withValidations([]admissionregistrationv1beta1.Validation{
+	policy := withValidations([]admissionregistrationv1.Validation{
 		{
 			Expression: "object.metadata.name.startsWith(params.kind.lowerAscii())",
 			Message:    "wrong paramKind",
 		},
-	}, withParams(paramKind, withNamespaceMatch(withFailurePolicy(admissionregistrationv1beta1.Fail, makePolicy("allowed-prefixes")))))
+	}, withParams(paramKind, withNamespaceMatch(withFailurePolicy(admissionregistrationv1.Fail, makePolicy("allowed-prefixes")))))
 	policy = withWaitReadyConstraintAndExpression(policy)
-	policy, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
+	policy, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -885,16 +886,16 @@ func Test_ValidatingAdmissionPolicy_UpdateParamKind(t *testing.T) {
 	checkFailureReason(t, err, metav1.StatusReasonInvalid)
 
 	// update the policy ParamKind to reference a Secret
-	paramKind = &admissionregistrationv1beta1.ParamKind{
+	paramKind = &admissionregistrationv1.ParamKind{
 		APIVersion: "v1",
 		Kind:       "Secret",
 	}
-	policy, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Get(context.TODO(), policy.Name, metav1.GetOptions{})
+	policy, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(context.TODO(), policy.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Error(err)
 	}
 	policy.Spec.ParamKind = paramKind
-	_, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Update(context.TODO(), policy, metav1.UpdateOptions{})
+	_, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Update(context.TODO(), policy, metav1.UpdateOptions{})
 	if err != nil {
 		t.Error(err)
 	}
@@ -943,7 +944,6 @@ func Test_ValidatingAdmissionPolicy_UpdateParamKind(t *testing.T) {
 // only the ParamRef in the binding is updated. This test creates a policy where namespaces must have a prefix that matches
 // the ParamRef set in the policy binding. The paramRef in the binding is then updated to a different object.
 func Test_ValidatingAdmissionPolicy_UpdateParamRef(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
 	server, err := apiservertesting.StartTestServer(t, nil, []string{
 		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
 	}, framework.SharedEtcd())
@@ -979,14 +979,14 @@ func Test_ValidatingAdmissionPolicy_UpdateParamRef(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	policy := withValidations([]admissionregistrationv1beta1.Validation{
+	policy := withValidations([]admissionregistrationv1.Validation{
 		{
 			Expression: "object.metadata.name.startsWith(params.metadata.name)",
 			Message:    "wrong paramRef",
 		},
-	}, withParams(configParamKind(), withNamespaceMatch(withFailurePolicy(admissionregistrationv1beta1.Fail, makePolicy("allowed-prefixes")))))
+	}, withParams(configParamKind(), withNamespaceMatch(withFailurePolicy(admissionregistrationv1.Fail, makePolicy("allowed-prefixes")))))
 	policy = withWaitReadyConstraintAndExpression(policy)
-	_, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
+	_, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1034,19 +1034,19 @@ func Test_ValidatingAdmissionPolicy_UpdateParamRef(t *testing.T) {
 	}
 
 	// Update the paramRef in the policy binding to use the test-2 ConfigMap
-	policyBinding, err := client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicyBindings().Get(context.TODO(), allowedPrefixesBinding.Name, metav1.GetOptions{})
+	policyBinding, err := client.AdmissionregistrationV1().ValidatingAdmissionPolicyBindings().Get(context.TODO(), allowedPrefixesBinding.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	denyAction := admissionregistrationv1beta1.DenyAction
+	denyAction := admissionregistrationv1.DenyAction
 	policyBindingCopy := policyBinding.DeepCopy()
-	policyBindingCopy.Spec.ParamRef = &admissionregistrationv1beta1.ParamRef{
+	policyBindingCopy.Spec.ParamRef = &admissionregistrationv1.ParamRef{
 		Name:                    "test-2",
 		Namespace:               "default",
 		ParameterNotFoundAction: &denyAction,
 	}
-	_, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicyBindings().Update(context.TODO(), policyBindingCopy, metav1.UpdateOptions{})
+	_, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicyBindings().Update(context.TODO(), policyBindingCopy, metav1.UpdateOptions{})
 	if err != nil {
 		t.Error(err)
 	}
@@ -1091,7 +1091,6 @@ func Test_ValidatingAdmissionPolicy_UpdateParamRef(t *testing.T) {
 
 // Test_ValidatingAdmissionPolicy_UpdateParamResource validates behavior of a policy after updates to the param resource.
 func Test_ValidatingAdmissionPolicy_UpdateParamResource(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
 	server, err := apiservertesting.StartTestServer(t, nil, []string{
 		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
 	}, framework.SharedEtcd())
@@ -1121,14 +1120,14 @@ func Test_ValidatingAdmissionPolicy_UpdateParamResource(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	policy := withValidations([]admissionregistrationv1beta1.Validation{
+	policy := withValidations([]admissionregistrationv1.Validation{
 		{
 			Expression: "object.metadata.name.startsWith(params.data['prefix'])",
 			Message:    "wrong prefix",
 		},
-	}, withParams(configParamKind(), withNamespaceMatch(withFailurePolicy(admissionregistrationv1beta1.Fail, makePolicy("allowed-prefixes")))))
+	}, withParams(configParamKind(), withNamespaceMatch(withFailurePolicy(admissionregistrationv1.Fail, makePolicy("allowed-prefixes")))))
 	policy = withWaitReadyConstraintAndExpression(policy)
-	_, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
+	_, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1224,7 +1223,6 @@ func Test_ValidatingAdmissionPolicy_UpdateParamResource(t *testing.T) {
 }
 
 func Test_ValidatingAdmissionPolicy_MatchByObjectSelector(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
 	server, err := apiservertesting.StartTestServer(t, nil, []string{
 		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
 	}, framework.SharedEtcd())
@@ -1246,15 +1244,15 @@ func Test_ValidatingAdmissionPolicy_MatchByObjectSelector(t *testing.T) {
 		},
 	}
 
-	policy := withValidations([]admissionregistrationv1beta1.Validation{
+	policy := withValidations([]admissionregistrationv1.Validation{
 		{
 			Expression: "false",
 			Message:    "matched by object selector!",
 		},
-	}, withConfigMapMatch(withFailurePolicy(admissionregistrationv1beta1.Fail, makePolicy("match-by-object-selector"))))
+	}, withConfigMapMatch(withFailurePolicy(admissionregistrationv1.Fail, makePolicy("match-by-object-selector"))))
 	policy = withObjectSelector(labelSelector, policy)
 	policy = withWaitReadyConstraintAndExpression(policy)
-	_, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
+	_, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1292,7 +1290,6 @@ func Test_ValidatingAdmissionPolicy_MatchByObjectSelector(t *testing.T) {
 }
 
 func Test_ValidatingAdmissionPolicy_MatchByNamespaceSelector(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
 	server, err := apiservertesting.StartTestServer(t, nil, []string{
 		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
 	}, framework.SharedEtcd())
@@ -1319,21 +1316,21 @@ func Test_ValidatingAdmissionPolicy_MatchByNamespaceSelector(t *testing.T) {
 		},
 	}
 
-	policy := withValidations([]admissionregistrationv1beta1.Validation{
+	policy := withValidations([]admissionregistrationv1.Validation{
 		{
 			Expression: "false",
 			Message:    "matched by namespace selector!",
 		},
-	}, withConfigMapMatch(withFailurePolicy(admissionregistrationv1beta1.Fail, makePolicy("match-by-namespace-selector"))))
+	}, withConfigMapMatch(withFailurePolicy(admissionregistrationv1.Fail, makePolicy("match-by-namespace-selector"))))
 	policy = withNamespaceSelector(labelSelector, policy)
 	policy = withWaitReadyConstraintAndExpression(policy)
-	_, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
+	_, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	policyBinding := makeBinding("match-by-namespace-selector-binding", "match-by-namespace-selector", "")
-	_, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicyBindings().Create(context.TODO(), policyBinding, metav1.CreateOptions{})
+	_, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicyBindings().Create(context.TODO(), policyBinding, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1384,7 +1381,6 @@ func Test_ValidatingAdmissionPolicy_MatchByNamespaceSelector(t *testing.T) {
 }
 
 func Test_ValidatingAdmissionPolicy_MatchByResourceNames(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
 	server, err := apiservertesting.StartTestServer(t, nil, []string{
 		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
 	}, framework.SharedEtcd())
@@ -1400,15 +1396,15 @@ func Test_ValidatingAdmissionPolicy_MatchByResourceNames(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	policy := withValidations([]admissionregistrationv1beta1.Validation{
+	policy := withValidations([]admissionregistrationv1.Validation{
 		{
 			Expression: "false",
 			Message:    "matched by resource names!",
 		},
-	}, withConfigMapMatch(withFailurePolicy(admissionregistrationv1beta1.Fail, makePolicy("match-by-resource-names"))))
+	}, withConfigMapMatch(withFailurePolicy(admissionregistrationv1.Fail, makePolicy("match-by-resource-names"))))
 	policy.Spec.MatchConstraints.ResourceRules[0].ResourceNames = []string{"matched-by-resource-name"}
 	policy = withWaitReadyConstraintAndExpression(policy)
-	_, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
+	_, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1443,7 +1439,6 @@ func Test_ValidatingAdmissionPolicy_MatchByResourceNames(t *testing.T) {
 }
 
 func Test_ValidatingAdmissionPolicy_MatchWithExcludeResources(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
 	server, err := apiservertesting.StartTestServer(t, nil, []string{
 		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
 	}, framework.SharedEtcd())
@@ -1459,21 +1454,21 @@ func Test_ValidatingAdmissionPolicy_MatchWithExcludeResources(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	policy := withValidations([]admissionregistrationv1beta1.Validation{
+	policy := withValidations([]admissionregistrationv1.Validation{
 		{
 			Expression: "false",
 			Message:    "not matched by exclude resources!",
 		},
-	}, withPolicyMatch("*", withFailurePolicy(admissionregistrationv1beta1.Fail, makePolicy("match-by-resource-names"))))
+	}, withPolicyMatch("*", withFailurePolicy(admissionregistrationv1.Fail, makePolicy("match-by-resource-names"))))
 
 	policy = withExcludePolicyMatch("configmaps", policy)
-	_, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
+	_, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	policyBinding := makeBinding("match-by-resource-names-binding", "match-by-resource-names", "")
-	_, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicyBindings().Create(context.TODO(), policyBinding, metav1.CreateOptions{})
+	_, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicyBindings().Create(context.TODO(), policyBinding, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1515,7 +1510,6 @@ func Test_ValidatingAdmissionPolicy_MatchWithExcludeResources(t *testing.T) {
 }
 
 func Test_ValidatingAdmissionPolicy_MatchWithMatchPolicyEquivalent(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
 	server, err := apiservertesting.StartTestServer(t, nil, []string{
 		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
 	}, framework.SharedEtcd())
@@ -1532,16 +1526,16 @@ func Test_ValidatingAdmissionPolicy_MatchWithMatchPolicyEquivalent(t *testing.T)
 		t.Fatal(err)
 	}
 
-	policy := withValidations([]admissionregistrationv1beta1.Validation{
+	policy := withValidations([]admissionregistrationv1.Validation{
 		{
 			Expression: "false",
 			Message:    "matched by equivalent match policy!",
 		},
-	}, withFailurePolicy(admissionregistrationv1beta1.Fail, makePolicy("match-by-match-policy-equivalent")))
-	policy.Spec.MatchConstraints = &admissionregistrationv1beta1.MatchResources{
-		ResourceRules: []admissionregistrationv1beta1.NamedRuleWithOperations{
+	}, withFailurePolicy(admissionregistrationv1.Fail, makePolicy("match-by-match-policy-equivalent")))
+	policy.Spec.MatchConstraints = &admissionregistrationv1.MatchResources{
+		ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{
 			{
-				RuleWithOperations: admissionregistrationv1beta1.RuleWithOperations{
+				RuleWithOperations: admissionregistrationv1.RuleWithOperations{
 					Operations: []admissionregistrationv1.OperationType{
 						"*",
 					},
@@ -1561,7 +1555,7 @@ func Test_ValidatingAdmissionPolicy_MatchWithMatchPolicyEquivalent(t *testing.T)
 		},
 	}
 	policy = withWaitReadyConstraintAndExpression(policy)
-	if _, err := client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
+	if _, err := client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1607,7 +1601,6 @@ func Test_ValidatingAdmissionPolicy_MatchWithMatchPolicyEquivalent(t *testing.T)
 }
 
 func Test_ValidatingAdmissionPolicy_MatchWithMatchPolicyExact(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
 	server, err := apiservertesting.StartTestServer(t, nil, []string{
 		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
 	}, framework.SharedEtcd())
@@ -1624,18 +1617,18 @@ func Test_ValidatingAdmissionPolicy_MatchWithMatchPolicyExact(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	policy := withValidations([]admissionregistrationv1beta1.Validation{
+	policy := withValidations([]admissionregistrationv1.Validation{
 		{
 			Expression: "false",
 			Message:    "matched by exact match policy!",
 		},
-	}, withFailurePolicy(admissionregistrationv1beta1.Fail, makePolicy("match-by-match-policy-exact")))
-	matchPolicyExact := admissionregistrationv1beta1.Exact
-	policy.Spec.MatchConstraints = &admissionregistrationv1beta1.MatchResources{
+	}, withFailurePolicy(admissionregistrationv1.Fail, makePolicy("match-by-match-policy-exact")))
+	matchPolicyExact := admissionregistrationv1.Exact
+	policy.Spec.MatchConstraints = &admissionregistrationv1.MatchResources{
 		MatchPolicy: &matchPolicyExact,
-		ResourceRules: []admissionregistrationv1beta1.NamedRuleWithOperations{
+		ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{
 			{
-				RuleWithOperations: admissionregistrationv1beta1.RuleWithOperations{
+				RuleWithOperations: admissionregistrationv1.RuleWithOperations{
 					Operations: []admissionregistrationv1.OperationType{
 						"*",
 					},
@@ -1655,7 +1648,7 @@ func Test_ValidatingAdmissionPolicy_MatchWithMatchPolicyExact(t *testing.T) {
 		},
 	}
 	policy = withWaitReadyConstraintAndExpression(policy)
-	if _, err := client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
+	if _, err := client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1701,10 +1694,7 @@ func Test_ValidatingAdmissionPolicy_MatchWithMatchPolicyExact(t *testing.T) {
 	}
 }
 
-// Test_ValidatingAdmissionPolicy_PolicyDeletedThenRecreated validates that deleting a ValidatingAdmissionPolicy
-// removes the policy from the apiserver admission chain and recreating it re-enables it.
-func Test_ValidatingAdmissionPolicy_PolicyDeletedThenRecreated(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
+func Test_ValidatingAdmissionPolicy_MatchExcludedResource(t *testing.T) {
 	server, err := apiservertesting.StartTestServer(t, nil, []string{
 		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
 	}, framework.SharedEtcd())
@@ -1720,14 +1710,80 @@ func Test_ValidatingAdmissionPolicy_PolicyDeletedThenRecreated(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	policy := withValidations([]admissionregistrationv1beta1.Validation{
+	policy := withValidations([]admissionregistrationv1.Validation{
+		{
+			Expression: "false",
+			Message:    "try to deny SelfSubjectReview",
+		},
+	}, withFailurePolicy(admissionregistrationv1.Fail, makePolicy("match-excluded-resources")))
+	policy.Spec.MatchConstraints = &admissionregistrationv1.MatchResources{
+		MatchPolicy: ptr.To(admissionregistrationv1.Exact),
+		ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{
+			{
+				RuleWithOperations: admissionregistrationv1.RuleWithOperations{
+					Operations: []admissionregistrationv1.OperationType{
+						"*",
+					},
+					Rule: admissionregistrationv1.Rule{
+						APIGroups: []string{
+							"authentication.k8s.io",
+						},
+						APIVersions: []string{
+							"v1",
+						},
+						Resources: []string{
+							"selfsubjectreviews",
+						},
+					},
+				},
+			},
+		},
+	}
+	policy = withWaitReadyConstraintAndExpression(policy)
+	if _, err := client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.Background(), policy, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("fail to create policy: %v", err)
+	}
+
+	policyBinding := makeBinding("match-by-match-policy-exact-binding", "match-excluded-resources", "")
+	if err := createAndWaitReady(t, client, policyBinding, nil); err != nil {
+		t.Fatalf("fail to create and wait for binding: %v", err)
+	}
+	r, err := client.AuthenticationV1().SelfSubjectReviews().Create(context.Background(), &authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("unexpected denied SelfSubjectReview: %v", err)
+	}
+	// confidence check the returned user info.
+	if len(r.Status.UserInfo.UID) == 0 {
+		t.Errorf("unexpected invalid user info: %v", r.Status.UserInfo)
+	}
+}
+
+// Test_ValidatingAdmissionPolicy_PolicyDeletedThenRecreated validates that deleting a ValidatingAdmissionPolicy
+// removes the policy from the apiserver admission chain and recreating it re-enables it.
+func Test_ValidatingAdmissionPolicy_PolicyDeletedThenRecreated(t *testing.T) {
+	server, err := apiservertesting.StartTestServer(t, nil, []string{
+		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
+	}, framework.SharedEtcd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.TearDownFn()
+
+	config := server.ClientConfig
+
+	client, err := clientset.NewForConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	policy := withValidations([]admissionregistrationv1.Validation{
 		{
 			Expression: "object.metadata.name.startsWith('test')",
 			Message:    "wrong prefix",
 		},
-	}, withParams(configParamKind(), withNamespaceMatch(withFailurePolicy(admissionregistrationv1beta1.Fail, makePolicy("allowed-prefixes")))))
+	}, withParams(configParamKind(), withNamespaceMatch(withFailurePolicy(admissionregistrationv1.Fail, makePolicy("allowed-prefixes")))))
 	policy = withWaitReadyConstraintAndExpression(policy)
-	_, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
+	_, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1764,7 +1820,7 @@ func Test_ValidatingAdmissionPolicy_PolicyDeletedThenRecreated(t *testing.T) {
 	}
 
 	// delete the binding object and validate that policy is not enforced
-	if err := client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Delete(context.TODO(), "allowed-prefixes", metav1.DeleteOptions{}); err != nil {
+	if err := client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Delete(context.TODO(), "allowed-prefixes", metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1789,7 +1845,7 @@ func Test_ValidatingAdmissionPolicy_PolicyDeletedThenRecreated(t *testing.T) {
 		t.Errorf("timed out waiting: %v", err)
 	}
 
-	_, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
+	_, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1822,7 +1878,6 @@ func Test_ValidatingAdmissionPolicy_PolicyDeletedThenRecreated(t *testing.T) {
 // Test_ValidatingAdmissionPolicy_BindingDeletedThenRecreated validates that deleting a ValidatingAdmissionPolicyBinding
 // removes the policy from the apiserver admission chain and recreating it re-enables it.
 func Test_ValidatingAdmissionPolicy_BindingDeletedThenRecreated(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
 	server, err := apiservertesting.StartTestServer(t, nil, []string{
 		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
 	}, framework.SharedEtcd())
@@ -1838,14 +1893,14 @@ func Test_ValidatingAdmissionPolicy_BindingDeletedThenRecreated(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	policy := withValidations([]admissionregistrationv1beta1.Validation{
+	policy := withValidations([]admissionregistrationv1.Validation{
 		{
 			Expression: "object.metadata.name.startsWith('test')",
 			Message:    "wrong prefix",
 		},
-	}, withParams(configParamKind(), withNamespaceMatch(withFailurePolicy(admissionregistrationv1beta1.Fail, makePolicy("allowed-prefixes")))))
+	}, withParams(configParamKind(), withNamespaceMatch(withFailurePolicy(admissionregistrationv1.Fail, makePolicy("allowed-prefixes")))))
 	policy = withWaitReadyConstraintAndExpression(policy)
-	_, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
+	_, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1882,7 +1937,7 @@ func Test_ValidatingAdmissionPolicy_BindingDeletedThenRecreated(t *testing.T) {
 	}
 
 	// delete the binding object and validate that policy is not enforced
-	if err := client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicyBindings().Delete(context.TODO(), "allowed-prefixes-binding", metav1.DeleteOptions{}); err != nil {
+	if err := client.AdmissionregistrationV1().ValidatingAdmissionPolicyBindings().Delete(context.TODO(), "allowed-prefixes-binding", metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1908,7 +1963,7 @@ func Test_ValidatingAdmissionPolicy_BindingDeletedThenRecreated(t *testing.T) {
 	}
 
 	// recreate the policy binding and test that policy is enforced again
-	_, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicyBindings().Create(context.TODO(), policyBinding, metav1.CreateOptions{})
+	_, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicyBindings().Create(context.TODO(), policyBinding, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1941,7 +1996,6 @@ func Test_ValidatingAdmissionPolicy_BindingDeletedThenRecreated(t *testing.T) {
 // Test_ValidatingAdmissionPolicy_ParamResourceDeletedThenRecreated validates that deleting a param resource referenced
 // by a binding renders the policy as invalid. Recreating the param resource re-enables the policy.
 func Test_ValidatingAdmissionPolicy_ParamResourceDeletedThenRecreated(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
 	server, err := apiservertesting.StartTestServer(t, nil, []string{
 		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
 	}, framework.SharedEtcd())
@@ -1967,14 +2021,14 @@ func Test_ValidatingAdmissionPolicy_ParamResourceDeletedThenRecreated(t *testing
 		t.Fatal(err)
 	}
 
-	policy := withValidations([]admissionregistrationv1beta1.Validation{
+	policy := withValidations([]admissionregistrationv1.Validation{
 		{
 			Expression: "object.metadata.name.startsWith(params.metadata.name)",
 			Message:    "wrong prefix",
 		},
-	}, withParams(configParamKind(), withNamespaceMatch(withFailurePolicy(admissionregistrationv1beta1.Fail, makePolicy("allowed-prefixes")))))
+	}, withParams(configParamKind(), withNamespaceMatch(withFailurePolicy(admissionregistrationv1.Fail, makePolicy("allowed-prefixes")))))
 	policy = withWaitReadyConstraintAndExpression(policy)
-	_, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
+	_, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2065,35 +2119,275 @@ func Test_ValidatingAdmissionPolicy_ParamResourceDeletedThenRecreated(t *testing
 	}
 }
 
-// TestCRDParams tests that a CustomResource can be used as a param resource for a ValidatingAdmissionPolicy.
-func TestCRDParams(t *testing.T) {
+// Test_CostLimitForValidation tests the cost limit set for a ValidatingAdmissionPolicy
+// with StrictCostEnforcementForVAP feature enabled.
+func Test_CostLimitForValidation(t *testing.T) {
+	resetPolicyRefreshInterval := generic.SetPolicyRefreshIntervalForTests(policyRefreshInterval)
+	defer resetPolicyRefreshInterval()
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.StrictCostEnforcementForVAP, true)
+	server, err := apiservertesting.StartTestServer(t, nil, []string{
+		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
+	}, framework.SharedEtcd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.TearDownFn()
+
+	config := server.ClientConfig
+	client, err := clientset.NewForConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	testcases := []struct {
 		name          string
-		resource      *unstructured.Unstructured
-		policy        *admissionregistrationv1beta1.ValidatingAdmissionPolicy
-		policyBinding *admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding
+		policy        *admissionregistrationv1.ValidatingAdmissionPolicy
+		err           string
+		failureReason metav1.StatusReason
+	}{
+		{
+			name: "With StrictCostEnforcementForVAP: Single expression exceeds per call cost limit for native library",
+			policy: withValidations([]admissionregistrationv1.Validation{
+				{
+					Expression: "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(x, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(y, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z2, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z3, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z4, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z5, int('1'.find('[0-9]*')) < 100)))))))",
+				},
+			}, withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
+			err:           "operation cancelled: actual cost limit exceeded",
+			failureReason: metav1.StatusReasonInvalid,
+		},
+		{
+			name: "With StrictCostEnforcementForVAP: Expression exceeds per call cost limit for extended library",
+			policy: withValidations([]admissionregistrationv1.Validation{
+				{
+
+					Expression: "authorizer.group('apps').resource('deployments').subresource('status').namespace('test').name('backend').check('create').allowed() && authorizer.group('apps').resource('deployments').subresource('status').namespace('test').name('backend').check('create').allowed() && authorizer.group('apps').resource('deployments').subresource('status').namespace('test').name('backend').check('create').allowed()",
+				},
+			}, withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
+			err:           "operation cancelled: actual cost limit exceeded",
+			failureReason: metav1.StatusReasonInvalid,
+		},
+		{
+			name: "With StrictCostEnforcementForVAP: Expression exceeds per call cost limit for extended library in variables",
+			policy: withVariables([]admissionregistrationv1.Variable{
+				{
+					Name:       "authzCheck",
+					Expression: "authorizer.group('apps').resource('deployments').subresource('status').namespace('test').name('backend').check('create').allowed() && authorizer.group('apps').resource('deployments').subresource('status').namespace('test').name('backend').check('create').allowed() && authorizer.group('apps').resource('deployments').subresource('status').namespace('test').name('backend').check('create').allowed()",
+				},
+			}, withValidations([]admissionregistrationv1.Validation{
+				{
+					Expression: "variables.authzCheck",
+				},
+			}, withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix"))))),
+			err:           "operation cancelled: actual cost limit exceeded",
+			failureReason: metav1.StatusReasonInvalid,
+		},
+		{
+			name: "With StrictCostEnforcementForVAP: Expression exceeds per call cost limit for extended library in matchConditions",
+			policy: withMatchConditions([]admissionregistrationv1.MatchCondition{
+				{
+					Name:       "test",
+					Expression: "authorizer.group('apps').resource('deployments').subresource('status').namespace('test').name('backend').check('create').allowed() && authorizer.group('apps').resource('deployments').subresource('status').namespace('test').name('backend').check('create').allowed() && authorizer.group('apps').resource('deployments').subresource('status').namespace('test').name('backend').check('create').allowed()",
+				},
+			}, withValidations([]admissionregistrationv1.Validation{
+				{
+					Expression: "true",
+				},
+			}, withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix"))))),
+			err:           "operation cancelled: actual cost limit exceeded",
+			failureReason: metav1.StatusReasonInvalid,
+		},
+		{
+			name:          "With StrictCostEnforcementForVAP: Expression exceeds per policy cost limit for extended library",
+			policy:        withValidations(generateValidationsWithAuthzCheck(29, "authorizer.group('apps').resource('deployments').subresource('status').namespace('test').name('backend').check('create').allowed()"), withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
+			err:           "validation failed due to running out of cost budget, no further validation rules will be run",
+			failureReason: metav1.StatusReasonInvalid,
+		},
+	}
+	for _, testcase := range testcases {
+		t.Run(testcase.name, func(t *testing.T) {
+			policy := withWaitReadyConstraintAndExpression(testcase.policy)
+			if _, err := client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			policyBinding := makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", "")
+			if err := createAndWaitReady(t, client, policyBinding, nil); err != nil {
+				t.Fatal(err)
+			}
+
+			ns := &v1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-k8s",
+				},
+			}
+			_, err = client.CoreV1().Namespaces().Create(context.TODO(), ns, metav1.CreateOptions{})
+			checkExpectedError(t, err, testcase.err)
+			checkFailureReason(t, err, testcase.failureReason)
+			if err := cleanupPolicy(t, client, policy, policyBinding); err != nil {
+				t.Fatalf("error while cleaning up policy and its bindings: %v", err)
+			}
+		})
+	}
+}
+
+// Test_CostLimitForValidationWithFeatureDisabled tests the cost limit set for a ValidatingAdmissionPolicy
+// with StrictCostEnforcementForVAP feature disabled.
+func Test_CostLimitForValidationWithFeatureDisabled(t *testing.T) {
+	resetPolicyRefreshInterval := generic.SetPolicyRefreshIntervalForTests(policyRefreshInterval)
+	defer resetPolicyRefreshInterval()
+	server, err := apiservertesting.StartTestServer(t, nil, []string{
+		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
+	}, framework.SharedEtcd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.TearDownFn()
+
+	config := server.ClientConfig
+	client, err := clientset.NewForConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testcases := []struct {
+		name          string
+		policy        *admissionregistrationv1.ValidatingAdmissionPolicy
+		err           string
+		failureReason metav1.StatusReason
+	}{
+		{
+			name: "Without StrictCostEnforcementForVAP: Single expression exceeds per call cost limit for native library",
+			policy: withValidations([]admissionregistrationv1.Validation{
+				{
+					Expression: "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(x, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(y, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z2, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z3, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z4, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].all(z5, int('1'.find('[0-9]*')) < 100)))))))",
+				},
+			}, withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
+			err:           "operation cancelled: actual cost limit exceeded",
+			failureReason: metav1.StatusReasonInvalid,
+		},
+		{
+			name: "Without StrictCostEnforcementForVAP: Expression does not exceed per call cost limit for extended library",
+			policy: withValidations([]admissionregistrationv1.Validation{
+				{
+
+					Expression: "authorizer.group('apps').resource('deployments').subresource('status').namespace('test').name('backend').check('create').allowed() && authorizer.group('apps').resource('deployments').subresource('status').namespace('test').name('backend').check('create').allowed() && authorizer.group('apps').resource('deployments').subresource('status').namespace('test').name('backend').check('create').allowed()",
+				},
+			}, withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
+		},
+		{
+			name: "Without StrictCostEnforcementForVAP: Expression does not exceed per call cost limit for extended library in variables",
+			policy: withVariables([]admissionregistrationv1.Variable{
+				{
+					Name:       "authzCheck",
+					Expression: "authorizer.group('apps').resource('deployments').subresource('status').namespace('test').name('backend').check('create').allowed() && authorizer.group('apps').resource('deployments').subresource('status').namespace('test').name('backend').check('create').allowed() && authorizer.group('apps').resource('deployments').subresource('status').namespace('test').name('backend').check('create').allowed()",
+				},
+			}, withValidations([]admissionregistrationv1.Validation{
+				{
+					Expression: "variables.authzCheck",
+				},
+			}, withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix"))))),
+		},
+		{
+			name:   "Without StrictCostEnforcementForVAP: Expression does not exceed per policy cost limit for extended library",
+			policy: withValidations(generateValidationsWithAuthzCheck(29, "authorizer.group('apps').resource('deployments').subresource('status').namespace('test').name('backend').check('create').allowed()"), withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy("validate-namespace-suffix")))),
+		},
+	}
+	for i, testcase := range testcases {
+		t.Run(testcase.name, func(t *testing.T) {
+			policy := withWaitReadyConstraintAndExpression(testcase.policy)
+			if _, err := client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			policyBinding := makeBinding("validate-namespace-suffix-binding", "validate-namespace-suffix", "")
+			if err := createAndWaitReady(t, client, policyBinding, nil); err != nil {
+				t.Fatal(err)
+			}
+
+			nsName := fmt.Sprintf("test-%d-k8s", i)
+			ns := &v1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: nsName,
+				},
+			}
+
+			_, err = client.CoreV1().Namespaces().Create(context.TODO(), ns, metav1.CreateOptions{})
+			checkExpectedError(t, err, testcase.err)
+			checkFailureReason(t, err, testcase.failureReason)
+			if err := cleanupPolicy(t, client, policy, policyBinding); err != nil {
+				t.Fatalf("error while cleaning up policy and its bindings: %v", err)
+			}
+		})
+	}
+}
+
+// generate n validation rules with provided expression
+func generateValidationsWithAuthzCheck(num int, exp string) []admissionregistrationv1.Validation {
+	var validations = make([]admissionregistrationv1.Validation, num)
+	for i := 0; i < num; i++ {
+		validations[i].Expression = exp
+	}
+	return validations
+}
+
+// TestCRDParams tests that a CustomResource can be used as a param resource for a ValidatingAdmissionPolicy.
+func TestCRDParams(t *testing.T) {
+	resetPolicyRefreshInterval := generic.SetPolicyRefreshIntervalForTests(policyRefreshInterval)
+	defer resetPolicyRefreshInterval()
+	server, err := apiservertesting.StartTestServer(t, nil, []string{
+		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
+	}, framework.SharedEtcd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.TearDownFn()
+
+	config := server.ClientConfig
+	client, err := clientset.NewForConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	crd := versionedCustomResourceDefinition()
+	etcd.CreateTestCRDs(t, apiextensionsclientset.NewForConfigOrDie(server.ClientConfig), false, crd)
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gvr := schema.GroupVersionResource{
+		Group:    crd.Spec.Group,
+		Version:  crd.Spec.Versions[0].Name,
+		Resource: crd.Spec.Names.Plural,
+	}
+	crClient := dynamicClient.Resource(gvr)
+
+	resource := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "awesome.bears.com/v1",
+		"kind":       "Panda",
+		"metadata": map[string]interface{}{
+			"name": "config-obj",
+		},
+		"spec": map[string]interface{}{
+			"nameCheck": "crd-test-k8s",
+		},
+	}}
+	_, err = crClient.Create(context.TODO(), resource, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("error creating %s: %s", gvr, err)
+	}
+
+	testcases := []struct {
+		name          string
+		policy        *admissionregistrationv1.ValidatingAdmissionPolicy
 		namespace     *v1.Namespace
 		err           string
 		failureReason metav1.StatusReason
 	}{
 		{
 			name: "a rule that uses data from a CRD param resource does NOT pass",
-			resource: &unstructured.Unstructured{Object: map[string]interface{}{
-				"apiVersion": "awesome.bears.com/v1",
-				"kind":       "Panda",
-				"metadata": map[string]interface{}{
-					"name": "config-obj",
-				},
-				"spec": map[string]interface{}{
-					"nameCheck": "crd-test-k8s",
-				},
-			}},
-			policy: withValidations([]admissionregistrationv1beta1.Validation{
+			policy: withValidations([]admissionregistrationv1.Validation{
 				{
 					Expression: "params.spec.nameCheck == object.metadata.name",
 				},
-			}, withNamespaceMatch(withParams(withCRDParamKind("Panda", "awesome.bears.com", "v1"), withFailurePolicy(admissionregistrationv1beta1.Fail, makePolicy("test-policy"))))),
-			policyBinding: makeBinding("crd-policy-binding", "test-policy", "config-obj"),
+			}, withNamespaceMatch(withParams(withCRDParamKind("Panda", "awesome.bears.com", "v1"), withFailurePolicy(admissionregistrationv1.Fail, makePolicy("test-policy"))))),
 			namespace: &v1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "incorrect-name",
@@ -2104,22 +2398,11 @@ func TestCRDParams(t *testing.T) {
 		},
 		{
 			name: "a rule that uses data from a CRD param resource that does pass",
-			resource: &unstructured.Unstructured{Object: map[string]interface{}{
-				"apiVersion": "awesome.bears.com/v1",
-				"kind":       "Panda",
-				"metadata": map[string]interface{}{
-					"name": "config-obj",
-				},
-				"spec": map[string]interface{}{
-					"nameCheck": "crd-test-k8s",
-				},
-			}},
-			policy: withValidations([]admissionregistrationv1beta1.Validation{
+			policy: withValidations([]admissionregistrationv1.Validation{
 				{
 					Expression: "params.spec.nameCheck == object.metadata.name",
 				},
-			}, withNamespaceMatch(withParams(withCRDParamKind("Panda", "awesome.bears.com", "v1"), withFailurePolicy(admissionregistrationv1beta1.Fail, makePolicy("test-policy"))))),
-			policyBinding: makeBinding("crd-policy-binding", "test-policy", "config-obj"),
+			}, withNamespaceMatch(withParams(withCRDParamKind("Panda", "awesome.bears.com", "v1"), withFailurePolicy(admissionregistrationv1.Fail, makePolicy("test-policy"))))),
 			namespace: &v1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "crd-test-k8s",
@@ -2131,46 +2414,14 @@ func TestCRDParams(t *testing.T) {
 
 	for _, testcase := range testcases {
 		t.Run(testcase.name, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
-			server, err := apiservertesting.StartTestServer(t, nil, []string{
-				"--enable-admission-plugins", "ValidatingAdmissionPolicy",
-			}, framework.SharedEtcd())
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer server.TearDownFn()
-
-			config := server.ClientConfig
-
-			client, err := clientset.NewForConfig(config)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			crd := versionedCustomResourceDefinition()
-			etcd.CreateTestCRDs(t, apiextensionsclientset.NewForConfigOrDie(server.ClientConfig), false, crd)
-			dynamicClient, err := dynamic.NewForConfig(config)
-			if err != nil {
-				t.Fatal(err)
-			}
-			gvr := schema.GroupVersionResource{
-				Group:    crd.Spec.Group,
-				Version:  crd.Spec.Versions[0].Name,
-				Resource: crd.Spec.Names.Plural,
-			}
-			crClient := dynamicClient.Resource(gvr)
-			_, err = crClient.Create(context.TODO(), testcase.resource, metav1.CreateOptions{})
-			if err != nil {
-				t.Fatalf("error creating %s: %s", gvr, err)
-			}
-
 			policy := withWaitReadyConstraintAndExpression(testcase.policy)
-			if _, err := client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
+			if _, err := client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
 				t.Fatal(err)
 			}
 			// remove default namespace since the CRD is cluster-scoped
-			testcase.policyBinding.Spec.ParamRef.Namespace = ""
-			if err := createAndWaitReady(t, client, testcase.policyBinding, nil); err != nil {
+			policyBinding := makeBinding("crd-policy-binding", "test-policy", "config-obj")
+			policyBinding.Spec.ParamRef.Namespace = ""
+			if err := createAndWaitReady(t, client, policyBinding, nil); err != nil {
 				t.Fatal(err)
 			}
 
@@ -2178,12 +2429,15 @@ func TestCRDParams(t *testing.T) {
 
 			checkExpectedError(t, err, testcase.err)
 			checkFailureReason(t, err, testcase.failureReason)
+			if err := cleanupPolicy(t, client, policy, policyBinding); err != nil {
+				t.Fatalf("error while cleaning up policy and its bindings: %v", err)
+			}
+
 		})
 	}
 }
 
 func TestBindingRemoval(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
 	server, err := apiservertesting.StartTestServer(t, nil, []string{
 		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
 	}, framework.SharedEtcd())
@@ -2199,14 +2453,14 @@ func TestBindingRemoval(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	policy := withValidations([]admissionregistrationv1beta1.Validation{
+	policy := withValidations([]admissionregistrationv1.Validation{
 		{
 			Expression: "false",
 			Message:    "policy still in effect",
 		},
-	}, withNamespaceMatch(withFailurePolicy(admissionregistrationv1beta1.Fail, makePolicy("test-policy"))))
+	}, withNamespaceMatch(withFailurePolicy(admissionregistrationv1.Fail, makePolicy("test-policy"))))
 	policy = withWaitReadyConstraintAndExpression(policy)
-	if _, err := client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
+	if _, err := client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2234,14 +2488,14 @@ func TestBindingRemoval(t *testing.T) {
 	}); waitErr != nil {
 		t.Errorf("timed out waiting: %v", waitErr)
 	}
-	if err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicyBindings().Delete(context.TODO(), "test-binding", metav1.DeleteOptions{}); err != nil {
+	if err = client.AdmissionregistrationV1().ValidatingAdmissionPolicyBindings().Delete(context.TODO(), "test-binding", metav1.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
 	// wait for binding to be deleted
 	if waitErr := wait.PollImmediate(time.Millisecond*10, wait.ForeverTestTimeout, func() (bool, error) {
 
-		_, err := client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicyBindings().Get(context.TODO(), "test-binding", metav1.GetOptions{})
+		_, err := client.AdmissionregistrationV1().ValidatingAdmissionPolicyBindings().Get(context.TODO(), "test-binding", metav1.GetOptions{})
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				return true, nil
@@ -2277,6 +2531,20 @@ func TestBindingRemoval(t *testing.T) {
 // Test_ValidateSecondaryAuthorization tests a ValidatingAdmissionPolicy that performs secondary authorization checks
 // for both users and service accounts.
 func Test_ValidateSecondaryAuthorization(t *testing.T) {
+	resetPolicyRefreshInterval := generic.SetPolicyRefreshIntervalForTests(policyRefreshInterval)
+	defer resetPolicyRefreshInterval()
+	server, err := apiservertesting.StartTestServer(t, nil, []string{
+		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
+		"--authorization-mode=RBAC",
+		"--anonymous-auth",
+	}, framework.SharedEtcd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.TearDownFn()
+
+	// For test set up such as creating policies, bindings and RBAC rules.
+	adminClient := clientset.NewForConfigOrDie(server.ClientConfig)
 	testcases := []struct {
 		name             string
 		rbac             *rbacv1.PolicyRule
@@ -2329,7 +2597,7 @@ func Test_ValidateSecondaryAuthorization(t *testing.T) {
 		},
 	}
 
-	for _, testcase := range testcases {
+	for i, testcase := range testcases {
 		t.Run(testcase.name, func(t *testing.T) {
 			clients := map[string]func(t *testing.T, adminClient *clientset.Clientset, clientConfig *rest.Config, rules []rbacv1.PolicyRule) *clientset.Clientset{
 				"user":           secondaryAuthorizationUserClient,
@@ -2338,20 +2606,6 @@ func Test_ValidateSecondaryAuthorization(t *testing.T) {
 
 			for clientName, clientFn := range clients {
 				t.Run(clientName, func(t *testing.T) {
-					defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
-					server, err := apiservertesting.StartTestServer(t, nil, []string{
-						"--enable-admission-plugins", "ValidatingAdmissionPolicy",
-						"--authorization-mode=RBAC",
-						"--anonymous-auth",
-					}, framework.SharedEtcd())
-					if err != nil {
-						t.Fatal(err)
-					}
-					defer server.TearDownFn()
-
-					// For test set up such as creating policies, bindings and RBAC rules.
-					adminClient := clientset.NewForConfigOrDie(server.ClientConfig)
-
 					// Principal is always allowed to create and update namespaces so that the admission requests to test
 					// authorization expressions can be sent by the principal.
 					rules := []rbacv1.PolicyRule{{
@@ -2373,21 +2627,24 @@ func Test_ValidateSecondaryAuthorization(t *testing.T) {
 						testcase.extraAccountFn(t, adminClient, server.ClientConfig, extraRules)
 					}
 
-					policy := withWaitReadyConstraintAndExpression(withValidations([]admissionregistrationv1beta1.Validation{
+					policyName := fmt.Sprintf("%s-%s-%d", "validate-authz", clientName, i)
+					policy := withWaitReadyConstraintAndExpression(withValidations([]admissionregistrationv1.Validation{
 						{
 							Expression: testcase.expression,
 						},
-					}, withFailurePolicy(admissionregistrationv1beta1.Fail, withNamespaceMatch(makePolicy("validate-authz")))))
-					if _, err := adminClient.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
+					}, withFailurePolicy(admissionregistrationv1.Fail, withNamespaceMatch(makePolicy(policyName)))))
+					if _, err := adminClient.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{}); err != nil {
 						t.Fatal(err)
 					}
-					if err := createAndWaitReady(t, adminClient, makeBinding("validate-authz-binding", "validate-authz", ""), nil); err != nil {
+					policyBindingName := fmt.Sprintf("%s-%s", policyName, "binding")
+					policyBinding := makeBinding(policyBindingName, policyName, "")
+					if err := createAndWaitReady(t, adminClient, policyBinding, nil); err != nil {
 						t.Fatal(err)
 					}
 
 					ns := &v1.Namespace{
 						ObjectMeta: metav1.ObjectMeta{
-							Name: "test-authz",
+							Name: fmt.Sprintf("%s-%s-%d", "test-authz", clientName, i),
 						},
 					}
 					_, err = client.CoreV1().Namespaces().Create(context.TODO(), ns, metav1.CreateOptions{})
@@ -2397,7 +2654,329 @@ func Test_ValidateSecondaryAuthorization(t *testing.T) {
 						expected = metav1.StatusReasonInvalid
 					}
 					checkFailureReason(t, err, expected)
+					if err := cleanupPolicy(t, adminClient, policy, policyBinding); err != nil {
+						t.Fatalf("error while cleaning up policy and its bindings: %v", err)
+					}
 				})
+			}
+		})
+	}
+}
+
+func TestCRDsOnStartup(t *testing.T) {
+
+	testContext, testCancel := context.WithCancel(context.Background())
+	defer testCancel()
+
+	// Start server and create CRD, and validatingadmission policy and binding
+	etcdConfig := framework.SharedEtcd()
+	server := apiservertesting.StartTestServerOrDie(t, nil, []string{
+		"--enable-admission-plugins", "ValidatingAdmissionPolicy",
+		"--authorization-mode=RBAC",
+		"--anonymous-auth",
+	}, etcdConfig)
+	client := clientset.NewForConfigOrDie(server.ClientConfig)
+	dynamicClient := dynamic.NewForConfigOrDie(server.ClientConfig)
+	apiextclient := apiextensionsclientset.NewForConfigOrDie(server.ClientConfig)
+	myCRD := &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "foos.cr.bar.com",
+		},
+		Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+			Group: "cr.bar.com",
+			Scope: apiextensionsv1.NamespaceScoped,
+			Names: apiextensionsv1.CustomResourceDefinitionNames{
+				Plural: "foos",
+				Kind:   "Foo",
+			},
+			Versions: []apiextensionsv1.CustomResourceDefinitionVersion{
+				{
+					Name:    "v1",
+					Served:  true,
+					Storage: true,
+					Schema:  fixtures.AllowAllSchema(),
+				},
+			},
+		},
+	}
+
+	// Create a bunch of fake CRDs to make the initial startup sync take a long time
+	for i := 0; i < 100; i++ {
+		crd := myCRD.DeepCopy()
+		crd.Name = fmt.Sprintf("foos%d.cr.bar.com", i)
+		crd.Spec.Names.Plural = fmt.Sprintf("foos%d", i)
+		crd.Spec.Names.Kind = fmt.Sprintf("Foo%d", i)
+
+		if _, err := apiextclient.ApiextensionsV1().CustomResourceDefinitions().Create(context.Background(), crd, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	etcd.CreateTestCRDs(t, apiextclient, false, myCRD)
+	crdGVK := schema.GroupVersionKind{
+		Group:   "cr.bar.com",
+		Version: "v1",
+		Kind:    "Foo",
+	}
+	crdGVR := crdGVK.GroupVersion().WithResource("foos")
+
+	param := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"metadata": map[string]interface{}{
+				"name":      "test",
+				"namespace": "default",
+			},
+			"foo": "bar",
+		},
+	}
+	param.GetObjectKind().SetGroupVersionKind(crdGVK)
+
+	if _, err := dynamicClient.Resource(crdGVR).Namespace("default").Create(context.TODO(), param, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	policy := withValidations([]admissionregistrationv1.Validation{
+		{
+			Expression: "object.metadata.name.startsWith(params.metadata.name)",
+			Message:    "wrong prefix",
+		},
+	}, withParams(withCRDParamKind(crdGVK.Kind, crdGVK.Group, crdGVK.Version), withNamespaceMatch(withFailurePolicy(admissionregistrationv1.Fail, makePolicy("allowed-prefixes")))))
+	policy = withWaitReadyConstraintAndExpression(policy)
+	_, err := client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(context.TODO(), policy, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// validate that namespaces starting with "test" are allowed
+	policyBinding := makeBinding("allowed-prefixes-binding", "allowed-prefixes", "test")
+	if err := createAndWaitReady(t, client, policyBinding, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	doCheck := func(client clientset.Interface) {
+		if waitErr := wait.PollUntilContextTimeout(testContext, time.Millisecond*100, 3*time.Minute, true, func(ctx context.Context) (bool, error) {
+			disallowedNamespace := &v1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					GenerateName: "not-test-",
+				},
+			}
+
+			_, err = client.CoreV1().Namespaces().Create(testContext, disallowedNamespace, metav1.CreateOptions{})
+			if err == nil {
+				return false, nil
+			}
+
+			if strings.Contains(err.Error(), "not yet synced to use for admission") {
+				return false, nil
+			}
+
+			if strings.Contains(err.Error(), "failed to find resource referenced by paramKind") {
+				return false, nil
+			}
+
+			if !strings.Contains(err.Error(), "wrong prefix") {
+				return false, err
+			}
+
+			return true, nil
+		}); waitErr != nil {
+			t.Errorf("timed out waiting: %v", err)
+		}
+	}
+
+	// Show that the policy & binding are correctly working before restarting
+	// to use the paramKind and deliver an error
+	doCheck(client)
+	server.TearDownFn()
+
+	// Start the server.
+	server = apiservertesting.StartTestServerOrDie(
+		t,
+		&apiservertesting.TestServerInstanceOptions{},
+		[]string{
+			"--enable-admission-plugins", "ValidatingAdmissionPolicy",
+			"--authorization-mode=RBAC",
+			"--anonymous-auth",
+		},
+		etcdConfig)
+	defer server.TearDownFn()
+
+	// Now that the server is restarted, show again that the policy & binding are correctly working
+	client = clientset.NewForConfigOrDie(server.ClientConfig)
+
+	doCheck(client)
+
+}
+
+func TestAuthorizationDecisionCaching(t *testing.T) {
+	resetPolicyRefreshInterval := generic.SetPolicyRefreshIntervalForTests(policyRefreshInterval)
+	defer resetPolicyRefreshInterval()
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+	var nChecks int
+	webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var review authorizationv1.SubjectAccessReview
+		if err := json.NewDecoder(r.Body).Decode(&review); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+
+		review.Status.Allowed = true
+		if review.Spec.ResourceAttributes.Verb == "test" {
+			nChecks++
+			review.Status.Reason = fmt.Sprintf("%d", nChecks)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(review); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	}))
+	defer webhook.Close()
+	kcfd, err := os.CreateTemp("", "kubeconfig-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	func() {
+		defer func() {
+			if err := kcfd.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}()
+		tmpl, err := template.New("kubeconfig").Parse(`
+apiVersion: v1
+kind: Config
+clusters:
+  - name: test-authz-service
+    cluster:
+      server: {{ .Server }}
+users:
+  - name: test-api-server
+current-context: webhook
+contexts:
+- context:
+    cluster: test-authz-service
+    user: test-api-server
+  name: webhook
+`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = tmpl.Execute(kcfd, struct {
+			Server string
+		}{
+			Server: webhook.URL,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+	_, config, teardown := framework.StartTestServer(ctx, t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(options *options.ServerRunOptions) {
+			options.Admission.GenericAdmission.EnablePlugins = append(options.Admission.GenericAdmission.EnablePlugins, "ValidatingAdmissionPolicy")
+			if err = options.APIEnablement.RuntimeConfig.Set("api/all=true"); err != nil {
+				t.Fatal(err)
+			}
+
+			options.Authorization.Modes = []string{authzmodes.ModeWebhook}
+			options.Authorization.WebhookConfigFile = kcfd.Name()
+			options.Authorization.WebhookVersion = "v1"
+			// Bypass webhook cache to observe the policy plugin's cache behavior.
+			options.Authorization.WebhookCacheAuthorizedTTL = 0
+			options.Authorization.WebhookCacheUnauthorizedTTL = 0
+		},
+	})
+	defer teardown()
+
+	config = rest.CopyConfig(config)
+	config.Impersonate = rest.ImpersonationConfig{
+		UserName: "alice",
+		UID:      "1234",
+	}
+	client, err := clientset.NewForConfig(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, tc := range []struct {
+		name        string
+		validations []admissionregistrationv1.Validation
+	}{
+		{
+			name: "hit",
+			validations: []admissionregistrationv1.Validation{
+				{
+					Expression: "authorizer.requestResource.check('test').reason() == authorizer.requestResource.check('test').reason()",
+				},
+			},
+		},
+		{
+			name: "miss",
+			validations: []admissionregistrationv1.Validation{
+				{
+					Expression: "authorizer.requestResource.subresource('a').check('test').reason() == '1'",
+				},
+				{
+					Expression: "authorizer.requestResource.subresource('b').check('test').reason() == '2'",
+				},
+				{
+					Expression: "authorizer.requestResource.subresource('c').check('test').reason() == '3'",
+				},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			policy := &admissionregistrationv1.ValidatingAdmissionPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-authorization-decision-caching-policy",
+				},
+				Spec: admissionregistrationv1.ValidatingAdmissionPolicySpec{
+					MatchConstraints: &admissionregistrationv1.MatchResources{
+						ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{
+							{
+								ResourceNames: []string{"test-authorization-decision-caching-namespace"},
+								RuleWithOperations: admissionregistrationv1.RuleWithOperations{
+									Operations: []admissionregistrationv1.OperationType{
+										admissionregistrationv1.Create,
+									},
+									Rule: admissionregistrationv1.Rule{
+										APIGroups:   []string{""},
+										APIVersions: []string{"v1"},
+										Resources:   []string{"namespaces"},
+									},
+								},
+							},
+						},
+					},
+					Validations: tc.validations,
+				},
+			}
+
+			policy, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Create(ctx, withWaitReadyConstraintAndExpression(policy), metav1.CreateOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			policyBinding := makeBinding(policy.Name+"-binding", policy.Name, "")
+			if err := createAndWaitReady(t, client, policyBinding, nil); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := client.CoreV1().Namespaces().Create(
+				ctx,
+				&v1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: fmt.Sprintf("test-authorization-decision-caching-namespace-%d", i),
+					},
+				},
+				metav1.CreateOptions{},
+			); err != nil {
+				if !apierrors.IsAlreadyExists(err) {
+					t.Fatal(err)
+				}
+			}
+
+			if err := cleanupPolicy(t, client, policy, policyBinding); err != nil {
+				t.Errorf("error while cleaning up policy and its bindings: %v", err)
 			}
 		})
 	}
@@ -2427,7 +3006,7 @@ func serviceAccountClient(namespace, name string) clientFn {
 	return func(t *testing.T, adminClient *clientset.Clientset, clientConfig *rest.Config, rules []rbacv1.PolicyRule) *clientset.Clientset {
 		clientConfig = rest.CopyConfig(clientConfig)
 		sa, err := adminClient.CoreV1().ServiceAccounts(namespace).Create(context.TODO(), &v1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: name}}, metav1.CreateOptions{})
-		if err != nil {
+		if err != nil && !apierrors.IsAlreadyExists(err) {
 			t.Fatal(err)
 		}
 		uid := sa.UID
@@ -2445,11 +3024,11 @@ func serviceAccountClient(namespace, name string) clientFn {
 	}
 }
 
-func withWaitReadyConstraintAndExpression(policy *admissionregistrationv1beta1.ValidatingAdmissionPolicy) *admissionregistrationv1beta1.ValidatingAdmissionPolicy {
+func withWaitReadyConstraintAndExpression(policy *admissionregistrationv1.ValidatingAdmissionPolicy) *admissionregistrationv1.ValidatingAdmissionPolicy {
 	policy = policy.DeepCopy()
-	policy.Spec.MatchConstraints.ResourceRules = append(policy.Spec.MatchConstraints.ResourceRules, admissionregistrationv1beta1.NamedRuleWithOperations{
+	policy.Spec.MatchConstraints.ResourceRules = append(policy.Spec.MatchConstraints.ResourceRules, admissionregistrationv1.NamedRuleWithOperations{
 		ResourceNames: []string{"test-marker"},
-		RuleWithOperations: admissionregistrationv1beta1.RuleWithOperations{
+		RuleWithOperations: admissionregistrationv1.RuleWithOperations{
 			Operations: []admissionregistrationv1.OperationType{
 				"UPDATE",
 			},
@@ -2466,22 +3045,22 @@ func withWaitReadyConstraintAndExpression(policy *admissionregistrationv1beta1.V
 			},
 		},
 	})
-	policy.Spec.Validations = append([]admissionregistrationv1beta1.Validation{{
+	policy.Spec.Validations = append([]admissionregistrationv1.Validation{{
 		Expression: "object.metadata.name != 'test-marker'",
 		Message:    "marker denied; policy is ready",
 	}}, policy.Spec.Validations...)
 	return policy
 }
 
-func createAndWaitReady(t *testing.T, client clientset.Interface, binding *admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding, matchLabels map[string]string) error {
+func createAndWaitReady(t *testing.T, client clientset.Interface, binding *admissionregistrationv1.ValidatingAdmissionPolicyBinding, matchLabels map[string]string) error {
 	return createAndWaitReadyNamespaced(t, client, binding, matchLabels, "default")
 }
 
-func createAndWaitReadyNamespaced(t *testing.T, client clientset.Interface, binding *admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding, matchLabels map[string]string, ns string) error {
+func createAndWaitReadyNamespaced(t *testing.T, client clientset.Interface, binding *admissionregistrationv1.ValidatingAdmissionPolicyBinding, matchLabels map[string]string, ns string) error {
 	return createAndWaitReadyNamespacedWithWarnHandler(t, client, binding, matchLabels, ns, newWarningHandler())
 }
 
-func createAndWaitReadyNamespacedWithWarnHandler(t *testing.T, client clientset.Interface, binding *admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding, matchLabels map[string]string, ns string, handler *warningHandler) error {
+func createAndWaitReadyNamespacedWithWarnHandler(t *testing.T, client clientset.Interface, binding *admissionregistrationv1.ValidatingAdmissionPolicyBinding, matchLabels map[string]string, ns string, handler *warningHandler) error {
 	marker := &v1.Endpoints{ObjectMeta: metav1.ObjectMeta{Name: "test-marker", Namespace: ns, Labels: matchLabels}}
 	defer func() {
 		err := client.CoreV1().Endpoints(ns).Delete(context.TODO(), marker.Name, metav1.DeleteOptions{})
@@ -2494,7 +3073,7 @@ func createAndWaitReadyNamespacedWithWarnHandler(t *testing.T, client clientset.
 		return err
 	}
 
-	_, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicyBindings().Create(context.TODO(), binding, metav1.CreateOptions{})
+	_, err = client.AdmissionregistrationV1().ValidatingAdmissionPolicyBindings().Create(context.TODO(), binding, metav1.CreateOptions{})
 	if err != nil {
 		return err
 	}
@@ -2510,6 +3089,12 @@ func createAndWaitReadyNamespacedWithWarnHandler(t *testing.T, client clientset.
 		} else if err != nil && strings.Contains(err.Error(), "not yet synced to use for admission") {
 			t.Logf("waiting for policy to be ready. Marker: %v. Admission not synced yet: %v", marker, err)
 			return false, nil
+		} else if err != nil && strings.Contains(err.Error(), "validation failed due to running out of cost budget, no further validation rules will be run") {
+			t.Logf("policy is ready and exceeds the budget: %v", err)
+			return true, nil
+		} else if err != nil && strings.Contains(err.Error(), "operation cancelled: actual cost limit exceeded") {
+			t.Logf("policy is ready and exceeds the budget: %v", err)
+			return true, nil
 		} else {
 			t.Logf("waiting for policy to be ready. Marker: %v, Last marker patch response: %v", marker, err)
 			return false, err
@@ -2522,8 +3107,41 @@ func createAndWaitReadyNamespacedWithWarnHandler(t *testing.T, client clientset.
 	return nil
 }
 
-func withMatchNamespace(binding *admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding, ns string) *admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding {
-	binding.Spec.MatchResources = &admissionregistrationv1beta1.MatchResources{
+func cleanupPolicy(t *testing.T, client clientset.Interface, policy *admissionregistrationv1.ValidatingAdmissionPolicy, binding *admissionregistrationv1.ValidatingAdmissionPolicyBinding) error {
+	err := client.AdmissionregistrationV1().ValidatingAdmissionPolicyBindings().Delete(context.TODO(), binding.Name, metav1.DeleteOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if waitErr := wait.PollUntilContextTimeout(context.TODO(), time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
+		_, err := client.AdmissionregistrationV1().ValidatingAdmissionPolicyBindings().Get(context.TODO(), binding.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}); waitErr != nil {
+		t.Fatalf("timed out waiting for policy binding to be cleaned up: %v", err)
+	}
+
+	if err := client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Delete(context.TODO(), policy.Name, metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if waitErr := wait.PollUntilContextTimeout(context.TODO(), time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
+		_, err := client.AdmissionregistrationV1().ValidatingAdmissionPolicies().Get(context.TODO(), policy.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, nil
+	}); waitErr != nil {
+		t.Fatalf("timed out waiting for policy to be cleaned up: %v", err)
+	}
+
+	return nil
+}
+
+func withMatchNamespace(binding *admissionregistrationv1.ValidatingAdmissionPolicyBinding, ns string) *admissionregistrationv1.ValidatingAdmissionPolicyBinding {
+	binding.Spec.MatchResources = &admissionregistrationv1.MatchResources{
 		NamespaceSelector: &metav1.LabelSelector{
 			MatchExpressions: []metav1.LabelSelectorRequirement{
 				{
@@ -2537,52 +3155,52 @@ func withMatchNamespace(binding *admissionregistrationv1beta1.ValidatingAdmissio
 	return binding
 }
 
-func makePolicy(name string) *admissionregistrationv1beta1.ValidatingAdmissionPolicy {
-	return &admissionregistrationv1beta1.ValidatingAdmissionPolicy{
+func makePolicy(name string) *admissionregistrationv1.ValidatingAdmissionPolicy {
+	return &admissionregistrationv1.ValidatingAdmissionPolicy{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 	}
 }
 
-func withParams(params *admissionregistrationv1beta1.ParamKind, policy *admissionregistrationv1beta1.ValidatingAdmissionPolicy) *admissionregistrationv1beta1.ValidatingAdmissionPolicy {
+func withParams(params *admissionregistrationv1.ParamKind, policy *admissionregistrationv1.ValidatingAdmissionPolicy) *admissionregistrationv1.ValidatingAdmissionPolicy {
 	policy.Spec.ParamKind = params
 	return policy
 }
 
-func configParamKind() *admissionregistrationv1beta1.ParamKind {
-	return &admissionregistrationv1beta1.ParamKind{
+func configParamKind() *admissionregistrationv1.ParamKind {
+	return &admissionregistrationv1.ParamKind{
 		APIVersion: "v1",
 		Kind:       "ConfigMap",
 	}
 }
 
-func withFailurePolicy(failure admissionregistrationv1beta1.FailurePolicyType, policy *admissionregistrationv1beta1.ValidatingAdmissionPolicy) *admissionregistrationv1beta1.ValidatingAdmissionPolicy {
+func withFailurePolicy(failure admissionregistrationv1.FailurePolicyType, policy *admissionregistrationv1.ValidatingAdmissionPolicy) *admissionregistrationv1.ValidatingAdmissionPolicy {
 	policy.Spec.FailurePolicy = &failure
 	return policy
 }
 
-func withNamespaceMatch(policy *admissionregistrationv1beta1.ValidatingAdmissionPolicy) *admissionregistrationv1beta1.ValidatingAdmissionPolicy {
+func withNamespaceMatch(policy *admissionregistrationv1.ValidatingAdmissionPolicy) *admissionregistrationv1.ValidatingAdmissionPolicy {
 	return withPolicyMatch("namespaces", policy)
 }
 
-func withConfigMapMatch(policy *admissionregistrationv1beta1.ValidatingAdmissionPolicy) *admissionregistrationv1beta1.ValidatingAdmissionPolicy {
+func withConfigMapMatch(policy *admissionregistrationv1.ValidatingAdmissionPolicy) *admissionregistrationv1.ValidatingAdmissionPolicy {
 	return withPolicyMatch("configmaps", policy)
 }
 
-func withObjectSelector(labelSelector *metav1.LabelSelector, policy *admissionregistrationv1beta1.ValidatingAdmissionPolicy) *admissionregistrationv1beta1.ValidatingAdmissionPolicy {
+func withObjectSelector(labelSelector *metav1.LabelSelector, policy *admissionregistrationv1.ValidatingAdmissionPolicy) *admissionregistrationv1.ValidatingAdmissionPolicy {
 	policy.Spec.MatchConstraints.ObjectSelector = labelSelector
 	return policy
 }
 
-func withNamespaceSelector(labelSelector *metav1.LabelSelector, policy *admissionregistrationv1beta1.ValidatingAdmissionPolicy) *admissionregistrationv1beta1.ValidatingAdmissionPolicy {
+func withNamespaceSelector(labelSelector *metav1.LabelSelector, policy *admissionregistrationv1.ValidatingAdmissionPolicy) *admissionregistrationv1.ValidatingAdmissionPolicy {
 	policy.Spec.MatchConstraints.NamespaceSelector = labelSelector
 	return policy
 }
 
-func withPolicyMatch(resource string, policy *admissionregistrationv1beta1.ValidatingAdmissionPolicy) *admissionregistrationv1beta1.ValidatingAdmissionPolicy {
-	policy.Spec.MatchConstraints = &admissionregistrationv1beta1.MatchResources{
-		ResourceRules: []admissionregistrationv1beta1.NamedRuleWithOperations{
+func withPolicyMatch(resource string, policy *admissionregistrationv1.ValidatingAdmissionPolicy) *admissionregistrationv1.ValidatingAdmissionPolicy {
+	policy.Spec.MatchConstraints = &admissionregistrationv1.MatchResources{
+		ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{
 			{
-				RuleWithOperations: admissionregistrationv1beta1.RuleWithOperations{
+				RuleWithOperations: admissionregistrationv1.RuleWithOperations{
 					Operations: []admissionregistrationv1.OperationType{
 						"*",
 					},
@@ -2604,10 +3222,10 @@ func withPolicyMatch(resource string, policy *admissionregistrationv1beta1.Valid
 	return policy
 }
 
-func withExcludePolicyMatch(resource string, policy *admissionregistrationv1beta1.ValidatingAdmissionPolicy) *admissionregistrationv1beta1.ValidatingAdmissionPolicy {
-	policy.Spec.MatchConstraints.ExcludeResourceRules = []admissionregistrationv1beta1.NamedRuleWithOperations{
+func withExcludePolicyMatch(resource string, policy *admissionregistrationv1.ValidatingAdmissionPolicy) *admissionregistrationv1.ValidatingAdmissionPolicy {
+	policy.Spec.MatchConstraints.ExcludeResourceRules = []admissionregistrationv1.NamedRuleWithOperations{
 		{
-			RuleWithOperations: admissionregistrationv1beta1.RuleWithOperations{
+			RuleWithOperations: admissionregistrationv1.RuleWithOperations{
 				Operations: []admissionregistrationv1.OperationType{
 					"*",
 				},
@@ -2628,9 +3246,9 @@ func withExcludePolicyMatch(resource string, policy *admissionregistrationv1beta
 	return policy
 }
 
-func withPolicyExistsLabels(labels []string, policy *admissionregistrationv1beta1.ValidatingAdmissionPolicy) *admissionregistrationv1beta1.ValidatingAdmissionPolicy {
+func withPolicyExistsLabels(labels []string, policy *admissionregistrationv1.ValidatingAdmissionPolicy) *admissionregistrationv1.ValidatingAdmissionPolicy {
 	if policy.Spec.MatchConstraints == nil {
-		policy.Spec.MatchConstraints = &admissionregistrationv1beta1.MatchResources{}
+		policy.Spec.MatchConstraints = &admissionregistrationv1.MatchResources{}
 	}
 	matchExprs := buildExistsSelector(labels)
 	policy.Spec.MatchConstraints.ObjectSelector = &metav1.LabelSelector{
@@ -2639,42 +3257,52 @@ func withPolicyExistsLabels(labels []string, policy *admissionregistrationv1beta
 	return policy
 }
 
-func withValidations(validations []admissionregistrationv1beta1.Validation, policy *admissionregistrationv1beta1.ValidatingAdmissionPolicy) *admissionregistrationv1beta1.ValidatingAdmissionPolicy {
+func withValidations(validations []admissionregistrationv1.Validation, policy *admissionregistrationv1.ValidatingAdmissionPolicy) *admissionregistrationv1.ValidatingAdmissionPolicy {
 	policy.Spec.Validations = validations
 	return policy
 }
 
-func withAuditAnnotations(auditAnnotations []admissionregistrationv1beta1.AuditAnnotation, policy *admissionregistrationv1beta1.ValidatingAdmissionPolicy) *admissionregistrationv1beta1.ValidatingAdmissionPolicy {
+func withVariables(variables []admissionregistrationv1.Variable, policy *admissionregistrationv1.ValidatingAdmissionPolicy) *admissionregistrationv1.ValidatingAdmissionPolicy {
+	policy.Spec.Variables = variables
+	return policy
+}
+
+func withMatchConditions(matchConditions []admissionregistrationv1.MatchCondition, policy *admissionregistrationv1.ValidatingAdmissionPolicy) *admissionregistrationv1.ValidatingAdmissionPolicy {
+	policy.Spec.MatchConditions = matchConditions
+	return policy
+}
+
+func withAuditAnnotations(auditAnnotations []admissionregistrationv1.AuditAnnotation, policy *admissionregistrationv1.ValidatingAdmissionPolicy) *admissionregistrationv1.ValidatingAdmissionPolicy {
 	policy.Spec.AuditAnnotations = auditAnnotations
 	return policy
 }
 
-func makeBinding(name, policyName, paramName string) *admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding {
-	var paramRef *admissionregistrationv1beta1.ParamRef
+func makeBinding(name, policyName, paramName string) *admissionregistrationv1.ValidatingAdmissionPolicyBinding {
+	var paramRef *admissionregistrationv1.ParamRef
 	if paramName != "" {
-		denyAction := admissionregistrationv1beta1.DenyAction
-		paramRef = &admissionregistrationv1beta1.ParamRef{
+		denyAction := admissionregistrationv1.DenyAction
+		paramRef = &admissionregistrationv1.ParamRef{
 			Name:                    paramName,
 			Namespace:               "default",
 			ParameterNotFoundAction: &denyAction,
 		}
 	}
-	return &admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding{
+	return &admissionregistrationv1.ValidatingAdmissionPolicyBinding{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
-		Spec: admissionregistrationv1beta1.ValidatingAdmissionPolicyBindingSpec{
+		Spec: admissionregistrationv1.ValidatingAdmissionPolicyBindingSpec{
 			PolicyName:        policyName,
 			ParamRef:          paramRef,
-			ValidationActions: []admissionregistrationv1beta1.ValidationAction{admissionregistrationv1beta1.Deny},
+			ValidationActions: []admissionregistrationv1.ValidationAction{admissionregistrationv1.Deny},
 		},
 	}
 }
 
-func withValidationActions(validationActions []admissionregistrationv1beta1.ValidationAction, binding *admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding) *admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding {
+func withValidationActions(validationActions []admissionregistrationv1.ValidationAction, binding *admissionregistrationv1.ValidatingAdmissionPolicyBinding) *admissionregistrationv1.ValidatingAdmissionPolicyBinding {
 	binding.Spec.ValidationActions = validationActions
 	return binding
 }
 
-func withBindingExistsLabels(labels []string, policy *admissionregistrationv1beta1.ValidatingAdmissionPolicy, binding *admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding) *admissionregistrationv1beta1.ValidatingAdmissionPolicyBinding {
+func withBindingExistsLabels(labels []string, policy *admissionregistrationv1.ValidatingAdmissionPolicy, binding *admissionregistrationv1.ValidatingAdmissionPolicyBinding) *admissionregistrationv1.ValidatingAdmissionPolicyBinding {
 	if policy != nil {
 		// shallow copy
 		constraintsCopy := *policy.Spec.MatchConstraints
@@ -2760,8 +3388,8 @@ func checkAuditEvents(t *testing.T, logFile *os.File, auditEvents []utils.AuditE
 	}
 }
 
-func withCRDParamKind(kind, crdGroup, crdVersion string) *admissionregistrationv1beta1.ParamKind {
-	return &admissionregistrationv1beta1.ParamKind{
+func withCRDParamKind(kind, crdGroup, crdVersion string) *admissionregistrationv1.ParamKind {
+	return &admissionregistrationv1.ParamKind{
 		APIVersion: crdGroup + "/" + crdVersion,
 		Kind:       kind,
 	}
@@ -2783,7 +3411,7 @@ func checkExpectedError(t *testing.T, err error, expectedErr string) {
 		t.Fatal("got error but expected none")
 	}
 
-	if err.Error() != expectedErr {
+	if !strings.Contains(err.Error(), expectedErr) {
 		t.Logf("actual validation error: %v", err)
 		t.Logf("expected validation error: %v", expectedErr)
 		t.Error("unexpected validation error")
@@ -2915,167 +3543,3 @@ rules:
         resources: ["configmaps"]
 `
 )
-
-func TestAuthorizationDecisionCaching(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		validations []admissionregistrationv1beta1.Validation
-	}{
-		{
-			name: "hit",
-			validations: []admissionregistrationv1beta1.Validation{
-				{
-					Expression: "authorizer.requestResource.check('test').reason() == authorizer.requestResource.check('test').reason()",
-				},
-			},
-		},
-		{
-			name: "miss",
-			validations: []admissionregistrationv1beta1.Validation{
-				{
-					Expression: "authorizer.requestResource.subresource('a').check('test').reason() == '1'",
-				},
-				{
-					Expression: "authorizer.requestResource.subresource('b').check('test').reason() == '2'",
-				},
-				{
-					Expression: "authorizer.requestResource.subresource('c').check('test').reason() == '3'",
-				},
-			},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.ValidatingAdmissionPolicy, true)()
-
-			ctx, cancel := context.WithCancel(context.TODO())
-			defer cancel()
-
-			var nChecks int
-			webhook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				var review authorizationv1.SubjectAccessReview
-				if err := json.NewDecoder(r.Body).Decode(&review); err != nil {
-					http.Error(w, err.Error(), http.StatusBadRequest)
-				}
-
-				review.Status.Allowed = true
-				if review.Spec.ResourceAttributes.Verb == "test" {
-					nChecks++
-					review.Status.Reason = fmt.Sprintf("%d", nChecks)
-				}
-
-				w.Header().Set("Content-Type", "application/json")
-				if err := json.NewEncoder(w).Encode(review); err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
-				}
-			}))
-			defer webhook.Close()
-
-			kcfd, err := os.CreateTemp("", "kubeconfig-")
-			if err != nil {
-				t.Fatal(err)
-			}
-			func() {
-				defer kcfd.Close()
-				tmpl, err := template.New("kubeconfig").Parse(`
-apiVersion: v1
-kind: Config
-clusters:
-  - name: test-authz-service
-    cluster:
-      server: {{ .Server }}
-users:
-  - name: test-api-server
-current-context: webhook
-contexts:
-- context:
-    cluster: test-authz-service
-    user: test-api-server
-  name: webhook
-`)
-				if err != nil {
-					t.Fatal(err)
-				}
-				err = tmpl.Execute(kcfd, struct {
-					Server string
-				}{
-					Server: webhook.URL,
-				})
-				if err != nil {
-					t.Fatal(err)
-				}
-			}()
-
-			client, config, teardown := framework.StartTestServer(ctx, t, framework.TestServerSetup{
-				ModifyServerRunOptions: func(options *options.ServerRunOptions) {
-					options.Admission.GenericAdmission.EnablePlugins = append(options.Admission.GenericAdmission.EnablePlugins, "ValidatingAdmissionPolicy")
-					options.APIEnablement.RuntimeConfig.Set("api/all=true")
-
-					options.Authorization.Modes = []string{authzmodes.ModeWebhook}
-					options.Authorization.WebhookConfigFile = kcfd.Name()
-					options.Authorization.WebhookVersion = "v1"
-					// Bypass webhook cache to observe the policy plugin's cache behavior.
-					options.Authorization.WebhookCacheAuthorizedTTL = 0
-					options.Authorization.WebhookCacheUnauthorizedTTL = 0
-				},
-			})
-			defer teardown()
-
-			policy := &admissionregistrationv1beta1.ValidatingAdmissionPolicy{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-authorization-decision-caching-policy",
-				},
-				Spec: admissionregistrationv1beta1.ValidatingAdmissionPolicySpec{
-					MatchConstraints: &admissionregistrationv1beta1.MatchResources{
-						ResourceRules: []admissionregistrationv1beta1.NamedRuleWithOperations{
-							{
-								ResourceNames: []string{"test-authorization-decision-caching-namespace"},
-								RuleWithOperations: admissionregistrationv1beta1.RuleWithOperations{
-									Operations: []admissionregistrationv1.OperationType{
-										admissionregistrationv1.Create,
-									},
-									Rule: admissionregistrationv1.Rule{
-										APIGroups:   []string{""},
-										APIVersions: []string{"v1"},
-										Resources:   []string{"namespaces"},
-									},
-								},
-							},
-						},
-					},
-					Validations: tc.validations,
-				},
-			}
-
-			policy, err = client.AdmissionregistrationV1beta1().ValidatingAdmissionPolicies().Create(ctx, withWaitReadyConstraintAndExpression(policy), metav1.CreateOptions{})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			if err := createAndWaitReady(t, client, makeBinding(policy.Name+"-binding", policy.Name, ""), nil); err != nil {
-				t.Fatal(err)
-			}
-
-			config = rest.CopyConfig(config)
-			config.Impersonate = rest.ImpersonationConfig{
-				UserName: "alice",
-				UID:      "1234",
-			}
-			client, err = clientset.NewForConfig(config)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			if _, err := client.CoreV1().Namespaces().Create(
-				ctx,
-				&v1.Namespace{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: "test-authorization-decision-caching-namespace",
-					},
-				},
-				metav1.CreateOptions{},
-			); err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
-}

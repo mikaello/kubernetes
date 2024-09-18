@@ -31,12 +31,13 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/klog/v2/ktesting"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
+	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
 	plugintesting "k8s.io/kubernetes/pkg/scheduler/framework/plugins/testing"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
-	"k8s.io/kubernetes/pkg/scheduler/internal/cache"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
+	tf "k8s.io/kubernetes/pkg/scheduler/testing/framework"
 	"k8s.io/utils/ptr"
 )
 
@@ -88,7 +89,7 @@ func TestPreScoreSkip(t *testing.T) {
 			_, ctx := ktesting.NewTestContext(t)
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
-			informerFactory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(tt.objs...), 0)
+			informerFactory := informers.NewSharedInformerFactory(fake.NewClientset(tt.objs...), 0)
 			f, err := frameworkruntime.NewFramework(ctx, nil, nil,
 				frameworkruntime.WithSnapshotSharedLister(cache.NewSnapshot(nil, tt.nodes)),
 				frameworkruntime.WithInformerFactory(informerFactory))
@@ -103,7 +104,7 @@ func TestPreScoreSkip(t *testing.T) {
 			informerFactory.WaitForCacheSync(ctx.Done())
 			p := pl.(*PodTopologySpread)
 			cs := framework.NewCycleState()
-			if s := p.PreScore(ctx, cs, tt.pod, tt.nodes); !s.IsSkip() {
+			if s := p.PreScore(ctx, cs, tt.pod, tf.BuildNodeInfos(tt.nodes)); !s.IsSkip() {
 				t.Fatalf("Expected skip but got %v", s.AsError())
 			}
 		})
@@ -438,7 +439,7 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 		{
 			name: "NodeAffinityPolicy honored with nodeAffinity",
 			pod: st.MakePod().Name("p").Label("foo", "").
-				NodeAffinityIn("foo", []string{""}).
+				NodeAffinityIn("foo", []string{""}, st.NodeSelectorTypeMatchExpressions).
 				SpreadConstraint(1, "zone", v1.ScheduleAnyway, barSelector, nil, nil, nil, nil).
 				Obj(),
 			nodes: []*v1.Node{
@@ -472,7 +473,7 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 		{
 			name: "NodeAffinityPolicy ignored with nodeAffinity",
 			pod: st.MakePod().Name("p").Label("foo", "").
-				NodeAffinityIn("foo", []string{""}).
+				NodeAffinityIn("foo", []string{""}, st.NodeSelectorTypeMatchExpressions).
 				SpreadConstraint(1, "zone", v1.ScheduleAnyway, barSelector, nil, &ignorePolicy, nil, nil).
 				Obj(),
 			nodes: []*v1.Node{
@@ -575,7 +576,7 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 			_, ctx := ktesting.NewTestContext(t)
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
-			informerFactory := informers.NewSharedInformerFactory(fake.NewSimpleClientset(tt.objs...), 0)
+			informerFactory := informers.NewSharedInformerFactory(fake.NewClientset(tt.objs...), 0)
 			f, err := frameworkruntime.NewFramework(ctx, nil, nil,
 				frameworkruntime.WithSnapshotSharedLister(cache.NewSnapshot(nil, tt.nodes)),
 				frameworkruntime.WithInformerFactory(informerFactory))
@@ -590,7 +591,7 @@ func TestPreScoreStateEmptyNodes(t *testing.T) {
 			informerFactory.WaitForCacheSync(ctx.Done())
 			p := pl.(*PodTopologySpread)
 			cs := framework.NewCycleState()
-			if s := p.PreScore(ctx, cs, tt.pod, tt.nodes); !s.IsSuccess() {
+			if s := p.PreScore(ctx, cs, tt.pod, tf.BuildNodeInfos(tt.nodes)); !s.IsSuccess() {
 				t.Fatal(s.AsError())
 			}
 
@@ -1163,7 +1164,7 @@ func TestPodTopologySpreadScore(t *testing.T) {
 		{
 			name: "NodeAffinityPolicy honoed with nodeAffinity",
 			pod: st.MakePod().Name("p").Label("foo", "").
-				NodeAffinityIn("foo", []string{""}).
+				NodeAffinityIn("foo", []string{""}, st.NodeSelectorTypeMatchExpressions).
 				SpreadConstraint(1, "node", v1.ScheduleAnyway, fooSelector, nil, nil, nil, nil).
 				Obj(),
 			nodes: []*v1.Node{
@@ -1187,7 +1188,7 @@ func TestPodTopologySpreadScore(t *testing.T) {
 		{
 			name: "NodeAffinityPolicy ignored with nodeAffinity",
 			pod: st.MakePod().Name("p").Label("foo", "").
-				NodeAffinityIn("foo", []string{""}).
+				NodeAffinityIn("foo", []string{""}, st.NodeSelectorTypeMatchExpressions).
 				SpreadConstraint(1, "node", v1.ScheduleAnyway, fooSelector, nil, &ignorePolicy, nil, nil).
 				Obj(),
 			nodes: []*v1.Node{
@@ -1347,7 +1348,7 @@ func TestPodTopologySpreadScore(t *testing.T) {
 			p.enableNodeInclusionPolicyInPodTopologySpread = tt.enableNodeInclusionPolicy
 			p.enableMatchLabelKeysInPodTopologySpread = tt.enableMatchLabelKeys
 
-			status := p.PreScore(ctx, state, tt.pod, tt.nodes)
+			status := p.PreScore(ctx, state, tt.pod, tf.BuildNodeInfos(tt.nodes))
 			if !status.IsSuccess() {
 				t.Errorf("unexpected error: %v", status)
 			}
@@ -1418,7 +1419,7 @@ func BenchmarkTestPodTopologySpreadScore(b *testing.B) {
 			pl := plugintesting.SetupPlugin(ctx, b, podTopologySpreadFunc, &config.PodTopologySpreadArgs{DefaultingType: config.ListDefaulting}, cache.NewSnapshot(existingPods, allNodes))
 			p := pl.(*PodTopologySpread)
 
-			status := p.PreScore(ctx, state, tt.pod, filteredNodes)
+			status := p.PreScore(ctx, state, tt.pod, tf.BuildNodeInfos(filteredNodes))
 			if !status.IsSuccess() {
 				b.Fatalf("unexpected error: %v", status)
 			}
@@ -1428,14 +1429,14 @@ func BenchmarkTestPodTopologySpreadScore(b *testing.B) {
 				var gotList framework.NodeScoreList
 				for _, n := range filteredNodes {
 					nodeName := n.Name
-					score, status := p.Score(context.Background(), state, tt.pod, nodeName)
+					score, status := p.Score(ctx, state, tt.pod, nodeName)
 					if !status.IsSuccess() {
 						b.Fatalf("unexpected error: %v", status)
 					}
 					gotList = append(gotList, framework.NodeScore{Name: nodeName, Score: score})
 				}
 
-				status = p.NormalizeScore(context.Background(), state, tt.pod, gotList)
+				status = p.NormalizeScore(ctx, state, tt.pod, gotList)
 				if !status.IsSuccess() {
 					b.Fatal(status)
 				}

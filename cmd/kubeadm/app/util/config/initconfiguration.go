@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -37,7 +38,7 @@ import (
 	bootstraptokenv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/bootstraptoken/v1"
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmscheme "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/scheme"
-	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
 	"k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/validation"
 	"k8s.io/kubernetes/cmd/kubeadm/app/componentconfigs"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
@@ -229,7 +230,7 @@ func DefaultedStaticInitConfiguration() (*kubeadmapi.InitConfiguration, error) {
 }
 
 // DefaultedInitConfiguration takes a versioned init config (often populated by flags), defaults it and converts it into internal InitConfiguration
-func DefaultedInitConfiguration(versionedInitCfg *kubeadmapiv1.InitConfiguration, versionedClusterCfg *kubeadmapiv1.ClusterConfiguration, skipCRIDetect bool) (*kubeadmapi.InitConfiguration, error) {
+func DefaultedInitConfiguration(versionedInitCfg *kubeadmapiv1.InitConfiguration, versionedClusterCfg *kubeadmapiv1.ClusterConfiguration, opts LoadOrDefaultConfigurationOptions) (*kubeadmapi.InitConfiguration, error) {
 	internalcfg := &kubeadmapi.InitConfiguration{}
 
 	// Takes passed flags into account; the defaulting is executed once again enforcing assignment of
@@ -245,7 +246,7 @@ func DefaultedInitConfiguration(versionedInitCfg *kubeadmapiv1.InitConfiguration
 	}
 
 	// Applies dynamic defaults to settings not provided with flags
-	if err := SetInitDynamicDefaults(internalcfg, skipCRIDetect); err != nil {
+	if err := SetInitDynamicDefaults(internalcfg, opts.SkipCRIDetect); err != nil {
 		return nil, err
 	}
 	// Validates cfg (flags/configs + defaults + dynamic defaults)
@@ -273,13 +274,20 @@ func LoadInitConfigurationFromFile(cfgPath string, opts LoadOrDefaultConfigurati
 // Right thereafter, the configuration is defaulted again with dynamic values (like IP addresses of a machine, etc)
 // Lastly, the internal config is validated and returned.
 func LoadOrDefaultInitConfiguration(cfgPath string, versionedInitCfg *kubeadmapiv1.InitConfiguration, versionedClusterCfg *kubeadmapiv1.ClusterConfiguration, opts LoadOrDefaultConfigurationOptions) (*kubeadmapi.InitConfiguration, error) {
+	var (
+		config *kubeadmapi.InitConfiguration
+		err    error
+	)
 	if cfgPath != "" {
 		// Loads configuration from config file, if provided
-		// Nb. --config overrides command line flags
-		return LoadInitConfigurationFromFile(cfgPath, opts)
+		config, err = LoadInitConfigurationFromFile(cfgPath, opts)
+	} else {
+		config, err = DefaultedInitConfiguration(versionedInitCfg, versionedClusterCfg, opts)
 	}
-
-	return DefaultedInitConfiguration(versionedInitCfg, versionedClusterCfg, opts.SkipCRIDetect)
+	if err == nil {
+		prepareStaticVariables(config)
+	}
+	return config, err
 }
 
 // BytesToInitConfiguration converts a byte slice to an internal, defaulted and validated InitConfiguration object.
@@ -300,9 +308,21 @@ func documentMapToInitConfiguration(gvkmap kubeadmapi.DocumentMap, allowDeprecat
 	var initcfg *kubeadmapi.InitConfiguration
 	var clustercfg *kubeadmapi.ClusterConfiguration
 
-	for gvk, fileContent := range gvkmap {
+	// Sort the GVKs deterministically by GVK string.
+	// This allows ClusterConfiguration to be decoded first.
+	gvks := make([]schema.GroupVersionKind, 0, len(gvkmap))
+	for gvk := range gvkmap {
+		gvks = append(gvks, gvk)
+	}
+	sort.Slice(gvks, func(i, j int) bool {
+		return gvks[i].String() < gvks[j].String()
+	})
+
+	for _, gvk := range gvks {
+		fileContent := gvkmap[gvk]
+
 		// first, check if this GVK is supported and possibly not deprecated
-		if err := validateSupportedVersion(gvk.GroupVersion(), allowDeprecated, allowExperimental); err != nil {
+		if err := validateSupportedVersion(gvk, allowDeprecated, allowExperimental); err != nil {
 			return nil, err
 		}
 

@@ -681,10 +681,7 @@ func stopDeployment(ctx context.Context, c clientset.Interface, ns, deploymentNa
 
 	framework.Logf("Ensuring deployment %s was deleted", deploymentName)
 	_, err = c.AppsV1().Deployments(ns).Get(ctx, deployment.Name, metav1.GetOptions{})
-	framework.ExpectError(err)
-	if !apierrors.IsNotFound(err) {
-		framework.Failf("Expected deployment %s to be deleted", deploymentName)
-	}
+	gomega.Expect(err).To(gomega.MatchError(apierrors.IsNotFound, fmt.Sprintf("Expected deployment %s to be deleted", deploymentName)))
 	framework.Logf("Ensuring deployment %s's RSes were deleted", deploymentName)
 	selector, err := metav1.LabelSelectorAsSelector(deployment.Spec.Selector)
 	framework.ExpectNoError(err)
@@ -1156,7 +1153,7 @@ func testDeploymentsControllerRef(ctx context.Context, f *framework.Framework) {
 	framework.ExpectNoError(err)
 
 	ginkgo.By("Wait for the ReplicaSet to be orphaned")
-	err = wait.PollWithContext(ctx, dRetryPeriod, dRetryTimeout, waitDeploymentReplicaSetsOrphaned(c, ns, podLabels))
+	err = wait.PollUntilContextTimeout(ctx, dRetryPeriod, dRetryTimeout, false, waitDeploymentReplicaSetsOrphaned(c, ns, podLabels))
 	framework.ExpectNoError(err, "error waiting for Deployment ReplicaSet to be orphaned")
 
 	deploymentName = "test-adopt-deployment"
