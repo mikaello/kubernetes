@@ -11944,7 +11944,7 @@ func schema_k8sio_api_authorization_v1_SelfSubjectAccessReview(ref common.Refere
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "SelfSubjectAccessReview checks whether or the current user can perform an action.  Not filling in a spec.namespace means \"in all namespaces\".  Self is a special case, because users should always be able to check whether they can perform an action",
+				Description: "SelfSubjectAccessReview checks whether or not the current user can perform an action.  Not filling in a spec.namespace means \"in all namespaces\".  Self is a special case, because users should always be able to check whether they can perform an action",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"kind": {
